@@ -1,11 +1,17 @@
-"""Pygame GUI for playing against the AlphaChess agent.
+"""Pygame GUI for playing against (or getting advice from) the AlphaChess agent.
 
-Two modes are supported:
+Modes:
 
 * **play**  -- click to move against the agent (H=hint, U=undo, ...).
-* **setup** -- an interactive board editor + analysis mode: place/remove
-  pieces with a palette, set the side to move and castling rights, then ask
-  the engine for the best move and a ranked list of candidates.
+* **advisor** -- a variant of play mode (``mode == "play"`` with
+  ``advisor=True``): the user makes every move for BOTH colours -- mirroring a
+  game played in a separate application -- and asks the engine for the best
+  move on demand (H / SPACE). The engine NEVER moves a piece on its own; it
+  only recommends. This is what the ``analyze`` command opens.
+* **setup** -- an interactive board editor: place/remove pieces with a palette,
+  set the side to move and castling rights, then either analyze the position or
+  adopt it (P) to play/advise from. Reachable via E; used to set up a mid-game
+  position when joining a game in progress.
 
 Importing this module does NOT open a window; only :func:`launch_gui`
 initializes the pygame display. The drawing is structured so a single frame
@@ -326,6 +332,7 @@ class _GuiApp:
         start_in_setup: bool = False,
         initial_fen: Optional[str] = None,
         has_display: bool = True,
+        advisor: bool = False,
     ) -> None:
         self.pygame = pygame
         self.surface = surface
@@ -334,6 +341,10 @@ class _GuiApp:
         self.agent_error = agent_error
         self.human_is_white = human_is_white
         self.simulations = simulations
+        # Advisor mode: the user makes every move for BOTH colours (mirroring an
+        # external game) and only asks the engine for suggestions -- the engine
+        # never moves a piece on its own. This is a variant of "play" mode.
+        self.advisor = advisor
 
         self.renderer = _Renderer(pygame)
         self.panel_font = pygame.font.SysFont("Arial", 20)
@@ -520,7 +531,9 @@ class _GuiApp:
 
     # -------------------------------------------------------------- play state
     def _human_turn(self) -> bool:
-        if self.agent is None:
+        # In advisor mode the user moves for BOTH colours, so it is always the
+        # human's turn regardless of whose side is on move.
+        if self.advisor or self.agent is None:
             return True
         return self.board.turn == (chess.WHITE if self.human_is_white else chess.BLACK)
 
@@ -545,7 +558,9 @@ class _GuiApp:
         self._refresh_status()
 
     def _undo(self) -> None:
-        plies = 2 if self.agent is not None else 1
+        # Advisor: the user made the last move -> pop a single ply. Same when
+        # there is no agent (human-vs-human). Only vs-agent play pops the pair.
+        plies = 1 if (self.advisor or self.agent is None) else 2
         for _ in range(plies):
             if self.board.move_stack:
                 self.board.pop()
@@ -555,7 +570,13 @@ class _GuiApp:
         self._refresh_status()
 
     def _hint(self) -> None:
-        if self.agent is None or self.board.is_game_over():
+        if self.agent is None:
+            self.hint_squares = None
+            self.hint_info = ["Load a model (--model) for suggestions."]
+            return
+        if self.board.is_game_over(claim_draw=True):
+            self.hint_squares = None
+            self.hint_info = [_game_over_text(self.board)]
             return
         try:
             info = self.agent.suggest_move(self.board)
@@ -567,7 +588,7 @@ class _GuiApp:
                     "value: %+.3f" % float(info.get("value", 0.0)),
                 ]
                 for san, prob in info.get("top_moves", [])[:5]:
-                    self.hint_info.append("  %-6s %.2f" % (san, prob))
+                    self.hint_info.append("  %-6s %4.1f%%" % (san, float(prob) * 100))
         except Exception as exc:  # pragma: no cover - defensive
             self.hint_info = ["Hint failed: %s" % exc]
 
@@ -732,7 +753,7 @@ class _GuiApp:
                 self.flipped = not self.flipped
             elif key == K.K_u:
                 self._undo()
-            elif key == K.K_h:
+            elif key in (K.K_h, K.K_SPACE, K.K_a):
                 self._hint()
         else:  # setup mode
             if key in (K.K_ESCAPE, K.K_e):      # ESC/E returns to play mode
@@ -775,7 +796,7 @@ class _GuiApp:
                 self.hint_squares, self.panel_font, self.panel_small,
                 self.panel_bold, self.status_msg, self.eval_msg,
                 self.hint_info, self.agent, self.agent_error, self.thinking,
-                self.coord_font,
+                self.coord_font, self.advisor,
             )
         else:
             self._draw_setup()
@@ -871,7 +892,7 @@ class _GuiApp:
         # --- key help pinned near the bottom ---
         help_lines = [
             "SPACE/A - analyze",
-            "P - play from position",
+            "P - use position" if self.advisor else "P - play from position",
             "T - side  C - clear board",
             "R - reset  X - eraser",
             "K - clear castling  F - flip",
@@ -903,6 +924,7 @@ class _GuiApp:
             # handled this frame are respected before the agent replies.
             agent_should_move = (
                 self.mode == "play"
+                and not self.advisor
                 and self.agent is not None
                 and not self.board.is_game_over(claim_draw=True)
                 and not self._human_turn()
@@ -928,6 +950,7 @@ def launch_gui(
     device=None,
     start_in_setup: bool = False,
     initial_fen: Optional[str] = None,
+    advisor: bool = False,
 ) -> None:
     """Launch an interactive pygame window to play against the agent.
 
@@ -941,6 +964,9 @@ def launch_gui(
         start_in_setup: Start directly in the board-editor / analysis mode.
         initial_fen: Optional FEN used to initialise the board (and, when
             ``start_in_setup``, the editor).
+        advisor: Open the ADVISOR board -- the user makes every move for BOTH
+            colours (mirroring an external game) and asks the engine for the
+            best move on demand; the engine never moves on its own.
     """
     import os
     import pygame
@@ -971,7 +997,7 @@ def launch_gui(
         agent=agent, agent_error=agent_error,
         human_is_white=human_is_white, simulations=simulations,
         start_in_setup=start_in_setup, initial_fen=initial_fen,
-        has_display=True,
+        has_display=True, advisor=advisor,
     )
     app.run(clock)
     pygame.quit()
@@ -999,6 +1025,23 @@ def _game_over_text(board: chess.Board) -> str:
     return "Game over - %s" % board.result(claim_draw=True)
 
 
+def _wrap_text(text: str, font, maxw: int) -> List[str]:
+    """Word-wrap ``text`` to fit within ``maxw`` pixels for ``font``."""
+    words = text.split(" ")
+    lines: List[str] = []
+    cur = ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if not cur or font.size(trial)[0] <= maxw:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def _build_move(board: chess.Board, frm: int, to: int) -> Optional[chess.Move]:
     """Construct a move, auto-promoting pawns to a queen on the last rank."""
     piece = board.piece_at(frm)
@@ -1014,8 +1057,14 @@ def _draw(
     pygame, screen, renderer, board, flipped, selected, legal_dests,
     hint_squares, panel_font, panel_small, panel_bold, status_msg,
     eval_msg, hint_info, agent, agent_error, thinking, coord_font=None,
+    advisor=False,
 ) -> None:
-    """Render the board, highlights, pieces and side panel (PLAY mode)."""
+    """Render the board, highlights, pieces and side panel (PLAY mode).
+
+    When ``advisor`` is True the panel/chrome switches to the advisor board:
+    the user moves both colours and asks the engine for suggestions on demand;
+    the engine never moves, so no "thinking" indicator is shown.
+    """
     # --- board backdrop + squares ---
     _draw_board_backdrop(pygame, screen, flipped)
 
@@ -1065,36 +1114,60 @@ def _draw(
         screen.blit(surf, (px, y))
         y += dy
 
-    line("AlphaChess", panel_bold, PANEL_FG, dy=34)
-    line(status_msg, panel_font, PANEL_FG, dy=30)
-
-    if thinking:
-        line("thinking...", panel_font, (250, 220, 120), dy=30)
-    elif eval_msg:
-        line(eval_msg, panel_small, PANEL_DIM, dy=26)
-
-    y += 6
-    if agent is None:
+    if advisor:
+        line("ADVISOR", panel_bold, PANEL_ACCENT, dy=30)
+        line("You move both sides", panel_small, PANEL_DIM, dy=24)
+        line(status_msg, panel_font, PANEL_FG, dy=30)
+        y += 4
+        # Surface any error (e.g. a bad --fen) whether or not a model is loaded.
         if agent_error:
-            line(agent_error, panel_small, (240, 160, 160), dy=22)
-        line("Human vs Human", panel_small, PANEL_DIM, dy=22)
-        line("(agent / hints disabled)", panel_small, PANEL_DIM, dy=26)
+            for _t in _wrap_text(agent_error, panel_small, PANEL_PX - 24):
+                line(_t, panel_small, (240, 160, 160), dy=22)
+        if agent is None:
+            line("Load a model (--model)", panel_small, PANEL_DIM, dy=22)
+            line("for suggestions.", panel_small, PANEL_DIM, dy=26)
+    else:
+        line("AlphaChess", panel_bold, PANEL_FG, dy=34)
+        line(status_msg, panel_font, PANEL_FG, dy=30)
 
-    # --- hint info block ---
+        if thinking:
+            line("thinking...", panel_font, (250, 220, 120), dy=30)
+        elif eval_msg:
+            line(eval_msg, panel_small, PANEL_DIM, dy=26)
+
+        y += 6
+        if agent is None:
+            if agent_error:
+                line(agent_error, panel_small, (240, 160, 160), dy=22)
+            line("Human vs Human", panel_small, PANEL_DIM, dy=22)
+            line("(agent / hints disabled)", panel_small, PANEL_DIM, dy=26)
+
+    # --- hint info block (best-move suggestion) ---
     if hint_info:
         y += 6
         for text in hint_info:
             line(text, panel_small, (170, 200, 240), dy=22)
 
     # --- key help pinned near the bottom ---
-    help_lines = [
-        "H - hint",
-        "U - undo",
-        "N - new game",
-        "F - flip board",
-        "E - setup / editor",
-        "ESC/Q - quit",
-    ]
+    if advisor:
+        help_lines = [
+            "H / SPACE - best move",
+            "click - move either side",
+            "U - undo",
+            "E - set up position",
+            "F - flip",
+            "N - new game",
+            "Q - quit",
+        ]
+    else:
+        help_lines = [
+            "H - hint",
+            "U - undo",
+            "N - new game",
+            "F - flip board",
+            "E - setup / editor",
+            "ESC/Q - quit",
+        ]
     hy = WINDOW_H - 22 * len(help_lines) - 12
     for text in help_lines:
         surf = panel_small.render(text, True, PANEL_DIM)
