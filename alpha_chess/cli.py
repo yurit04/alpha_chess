@@ -5,7 +5,9 @@ Exposes an argparse-based CLI with these subcommands:
 * ``train``   -- run the from-scratch self-play training loop.
 * ``suggest`` -- load a trained model and print the best move for a position.
 * ``play``    -- launch the pygame GUI to play against the agent.
-* ``analyze`` -- launch the GUI directly in the board-editor / analysis mode.
+* ``analyze`` -- launch the ADVISOR board: you make every move for both
+  colours (mirroring a game played elsewhere) and ask the engine for the best
+  move on demand; the engine never moves on its own.
 
 Both ``python -m alpha_chess.cli`` and ``python -m alpha_chess`` route here via
 :func:`main`.
@@ -99,17 +101,21 @@ def _add_play_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _add_analyze_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Register the ``analyze`` subcommand (GUI board editor + analysis)."""
+    """Register the ``analyze`` subcommand (the ADVISOR board)."""
     p = subparsers.add_parser(
         "analyze",
-        help="Open the GUI directly in the setup / analysis (board editor) mode.",
+        help="Open the ADVISOR board: you move both sides, ask the engine for "
+             "the best move on demand (it never moves on its own).",
     )
     p.add_argument("--model", type=str, default="models/best.pt",
-                   help="Path to the trained model (optional; enables analysis).")
+                   help="Path to the trained model (optional; enables suggestions).")
     p.add_argument("--simulations", type=int, default=400,
-                   help="MCTS simulations per analysis.")
+                   help="MCTS simulations per suggestion.")
     p.add_argument("--fen", type=str, default=None,
-                   help="Optional FEN to prefill the editor.")
+                   help="Optional FEN for the STARTING position to follow from.")
+    p.add_argument("--setup", action="store_true",
+                   help="Start in the board editor first (to join a game in "
+                        "progress); applying the position lands on the advisor board.")
     p.add_argument("--device", type=str, default="auto",
                    help="Device preference: auto|cpu|cuda|mps.")
 
@@ -192,20 +198,21 @@ def _run_play(args: argparse.Namespace) -> None:
 
 
 def _run_analyze(args: argparse.Namespace) -> None:
-    """Dispatch the ``analyze`` subcommand: open the GUI in setup mode."""
+    """Dispatch the ``analyze`` subcommand: open the ADVISOR board."""
     from alpha_chess.gui import launch_gui
     from alpha_chess.network import get_device
 
     model_path = args.model if args.model and os.path.isfile(args.model) else None
     if args.model and model_path is None:
-        print("Warning: model '{}' not found; analysis disabled until a model "
-              "is loaded.".format(args.model), file=sys.stderr)
+        print("Warning: model '{}' not found; suggestions disabled until a "
+              "model is loaded.".format(args.model), file=sys.stderr)
 
     launch_gui(
         model_path=model_path,
         simulations=args.simulations,
         device=get_device(args.device),
-        start_in_setup=True,
+        advisor=True,
+        start_in_setup=args.setup,
         initial_fen=args.fen,
     )
 

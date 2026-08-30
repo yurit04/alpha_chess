@@ -15,7 +15,7 @@ trained agent or ask it for the best move in any position.
 2. [Quick start](#quick-start)
 3. [1. Train from scratch](#1-train-from-scratch)
 4. [2. Play in the GUI](#2-play-in-the-gui)
-5. [2b. Setup & analysis mode (board editor)](#2b-setup--analysis-mode-board-editor)
+5. [2b. Advisor board (analyze)](#2b-advisor-board-analyze)
 6. [3. Suggest the best move (CLI)](#3-suggest-the-best-move)
 7. [How it works](#how-it-works)
 8. [Project layout](#project-layout)
@@ -178,12 +178,12 @@ falls back to **human vs human** with the agent and hints disabled.
 
 - **Click** a piece, then click its destination to move. Pawns auto-promote to a
   queen.
-- **H** — hint: highlights the engine's suggested move and shows its evaluation
-  and top candidates in the side panel.
+- **H** / **SPACE** / **A** — hint: highlights the engine's suggested move and
+  shows its evaluation and top candidates in the side panel.
 - **U** — undo the last move (a full human+agent pair when playing the engine).
 - **N** — new game.
 - **F** — flip the board.
-- **E** — enter **setup / analysis mode** (board editor; see below).
+- **E** — enter the **board editor** (see below).
 - **ESC / Q** — quit.
 
 The side panel shows whose turn it is, check/checkmate/stalemate/draw status, a
@@ -191,28 +191,53 @@ The side panel shows whose turn it is, check/checkmate/stalemate/draw status, a
 
 ---
 
-## 2b. Setup & analysis mode (board editor)
+## 2b. Advisor board (analyze)
 
-Set up **any** position by hand and ask the engine for the best move and a
-ranked list of candidates — re-askable after every edit. Open it directly:
+The **advisor board** is for when you're playing a real game against another
+person in a *separate* application and want AlphaChess open alongside as a
+coach. **You** make every move for **both** colours (mirroring the external
+game) and, at any moment, ask the engine for the best move for whoever is to
+move. **The engine never moves a piece on its own** — it only recommends.
 
 ```bash
 .venv/bin/python -m alpha_chess.cli analyze \
   --model models/best.pt \
-  --simulations 400 \
-  --fen "8/8/8/8/8/2k5/8/2K1Q3 w - - 0 1"   # --fen is optional
+  --simulations 400
 ```
 
-…or press **E** at any time in `play` mode (also `play --setup` to start there).
-Entering setup copies the current board (pieces, side to move, castling rights)
-into the editor so you can tweak the live game or start fresh.
+`--model` defaults to `models/best.pt`. If no model is loaded the board still
+works for making moves; asking for a suggestion just shows
+"Load a model (--model) for suggestions."
+
+**Controls (advisor board)**
+
+- **Click** a piece then its destination to move — this works for **both**
+  White and Black, alternating naturally with whoever is on move. Only legal
+  moves are accepted; pawns auto-promote to a queen.
+- **H** / **SPACE** — ask for the best move for the side to move: the from/to
+  squares are highlighted and the panel shows the best move (SAN), its eval
+  (`[-1, +1]`, side-to-move perspective), and the top 5 candidates with their
+  visit-count percentages. Re-runnable after every move.
+- **U** — undo the last move (a **single** ply — you made it).
+- **E** — open the **board editor** (below) to set up a mid-game position when
+  you join a game already in progress.
+- **F** — flip the board.  **N** — new game (standard start position).
+- **Q / ESC** — quit.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--model` | `models/best.pt` | Checkpoint to load. If the file is missing → analysis disabled (editor still works). |
-| `--simulations` | `400` | MCTS simulations per analysis. |
-| `--fen` | *(none)* | Optional FEN to prefill the editor. |
+| `--model` | `models/best.pt` | Checkpoint to load. If the file is missing → suggestions disabled (the board still works). |
+| `--simulations` | `400` | MCTS simulations per suggestion. |
+| `--fen` | *(none)* | Optional FEN for the STARTING position to follow from. |
+| `--setup` | *(off)* | Start in the board editor first (to join a game in progress); applying the position lands on the advisor board. |
 | `--device` | `auto` | Inference device. |
+
+### Board editor (set up a mid-game position)
+
+Press **E** on the advisor board (or start with `analyze --setup`) to open the
+palette editor and set up **any** position by hand — useful when you join a game
+that's already underway. Entering the editor copies the current board (pieces,
+side to move, castling rights) so you can tweak it or start fresh.
 
 **Editing**
 
@@ -236,13 +261,15 @@ into the editor so you can tweak the live game or start fresh.
   the best move (SAN + eval in `[-1, +1]`, side-to-move perspective) plus the
   top 5 candidates with their visit-count percentages. Re-run after edits to
   refresh. Analysis works for whichever side is to move.
-- **P** — "play from this position": if legal, adopt the edited position as a
-  fresh game and switch to `play` mode.
-- **E / ESC** — leave setup and return to `play` mode.  **Q** — quit.
+- **P** — "use this position": if legal, adopt the edited position as a fresh
+  game. Opened from the advisor board, this returns you to the advisor board
+  (you keep moving both sides); from vs-agent `play` it returns to play mode.
+- **E / ESC** — leave the editor (cancel) and return to the board you came from.
+  **Q** — quit.
 
 Invalid positions are rejected with a specific reason (missing/too many kings,
 pawns on a back rank, the side *not* to move being in check, too many pieces,
-etc.) and are never analyzed or played.
+etc.) and are never analyzed or adopted.
 
 ---
 
@@ -420,7 +447,8 @@ random playouts, promotions, underpromotions, castling, and en passant.
   or use `--device cpu`.
 - **No model found at `models/best.pt`.** All commands default `--model` to
   `models/best.pt`. If it doesn't exist: `suggest` exits with an error, `play`
-  falls back to human-vs-human, and `analyze` opens the editor with analysis
-  disabled. Train first (creates `models/best.pt`) or pass an explicit
+  falls back to human-vs-human, and `analyze` opens the advisor board with
+  suggestions disabled (you can still move both sides). Train first (creates
+  `models/best.pt`) or pass an explicit
   `--model path/to/checkpoint.pt`. Note the path is relative to your current
   directory, so run from the repo root (or wherever your `models/` folder is).
