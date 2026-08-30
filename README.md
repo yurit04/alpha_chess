@@ -153,8 +153,7 @@ on MPS, set `PYTORCH_ENABLE_MPS_FALLBACK=1` in your environment or use
 
 ## 2. Play in the GUI
 
-Launch the pygame board. If `--model` is omitted or missing, the GUI runs
-**human vs human** with the agent and hints disabled.
+Launch the pygame board.
 
 ```bash
 .venv/bin/python -m alpha_chess.cli play \
@@ -163,9 +162,14 @@ Launch the pygame board. If `--model` is omitted or missing, the GUI runs
   --color white
 ```
 
+`--model` defaults to `models/best.pt`, so if you've trained with the default
+settings you can just run `play` with no flags. If the model file **cannot be
+found** (you haven't trained, or you point `--model` at a missing path), the GUI
+falls back to **human vs human** with the agent and hints disabled.
+
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--model` | `models/best.pt` | Checkpoint to load. Omit/missing → human vs human. |
+| `--model` | `models/best.pt` | Checkpoint to load. If the file is missing → human vs human. |
 | `--simulations` | `200` | MCTS simulations per agent move (higher = stronger, slower). |
 | `--color` | `white` | Which side **you** play. |
 | `--device` | `auto` | Inference device (see above). |
@@ -205,7 +209,7 @@ into the editor so you can tweak the live game or start fresh.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--model` | `models/best.pt` | Checkpoint to load. Omit/missing → analysis disabled. |
+| `--model` | `models/best.pt` | Checkpoint to load. If the file is missing → analysis disabled (editor still works). |
 | `--simulations` | `400` | MCTS simulations per analysis. |
 | `--fen` | *(none)* | Optional FEN to prefill the editor. |
 | `--device` | `auto` | Inference device. |
@@ -271,7 +275,7 @@ percentages are the MCTS visit-count distribution over candidate moves.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--fen` | start position | Position to analyze. |
-| `--model` | `models/best.pt` | Checkpoint to load. |
+| `--model` | `models/best.pt` | Checkpoint to load. Exits with an error if the file is missing. |
 | `--simulations` | `200` | MCTS simulations for the search. |
 | `--device` | `auto` | Inference device. |
 
@@ -414,5 +418,9 @@ random playouts, promotions, underpromotions, castling, and en passant.
   installed.
 - **MPS / unsupported-op errors on Mac.** Run with `PYTORCH_ENABLE_MPS_FALLBACK=1`
   or use `--device cpu`.
-- **`suggest`/`play` can't find the model.** Train first (creates
-  `models/best.pt`) or pass an explicit `--model path/to/checkpoint.pt`.
+- **No model found at `models/best.pt`.** All commands default `--model` to
+  `models/best.pt`. If it doesn't exist: `suggest` exits with an error, `play`
+  falls back to human-vs-human, and `analyze` opens the editor with analysis
+  disabled. Train first (creates `models/best.pt`) or pass an explicit
+  `--model path/to/checkpoint.pt`. Note the path is relative to your current
+  directory, so run from the repo root (or wherever your `models/` folder is).
