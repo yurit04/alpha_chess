@@ -44,8 +44,8 @@ class AlphaZeroNet(nn.Module):
     def __init__(
         self,
         num_planes: int = 19,
-        channels: int = 64,
-        num_blocks: int = 5,
+        channels: int = 128,
+        num_blocks: int = 10,
         policy_size: int = 4672,
     ) -> None:
         super().__init__()
