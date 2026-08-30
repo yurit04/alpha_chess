@@ -220,6 +220,7 @@ __marimo__/
 # alpha_chess model checkpoints
 models/
 models_smoke/
+models_smoke_gpu/
 
 # macOS
 .DS_Store

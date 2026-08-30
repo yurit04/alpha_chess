@@ -9,13 +9,17 @@ each visited position into a training example of the form
 """
 
 import random
-from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import chess
 
-from alpha_chess.encoding import encode_board, move_to_index, POLICY_SIZE
+from alpha_chess.encoding import (
+    encode_board,
+    move_to_index,
+    NUM_PLANES,
+    POLICY_SIZE,
+)
 from alpha_chess.mcts import MCTS
 
 
@@ -118,38 +122,66 @@ def play_game(
 
 
 class ReplayBuffer:
-    """Fixed-capacity ring buffer of self-play training examples."""
+    """Fixed-capacity ring buffer of self-play training examples.
+
+    Storage is a set of preallocated numpy arrays (``states``, ``policies``,
+    ``values``) plus a write cursor and a running size.  Writes wrap around the
+    end of the arrays, overwriting the oldest examples once full.  This gives
+    O(1) appends and O(1) random access for sampling, and keeps memory bounded
+    and contiguous (unlike a ``deque`` of small objects).
+    """
 
     def __init__(self, capacity: int = 100000):
-        self.capacity = capacity
-        self._buffer: deque = deque(maxlen=capacity)
+        self.capacity = int(capacity)
+        # Preallocated contiguous storage for each field.
+        self._states = np.zeros(
+            (self.capacity, NUM_PLANES, 8, 8), dtype=np.float32
+        )
+        self._policies = np.zeros(
+            (self.capacity, POLICY_SIZE), dtype=np.float32
+        )
+        self._values = np.zeros((self.capacity, 1), dtype=np.float32)
+        # Position of the next write and number of valid entries.
+        self._cursor = 0
+        self._size = 0
 
     def append(self, examples: List[dict]) -> None:
-        """Add a list of ``{"state","policy","value"}`` examples to the buffer."""
+        """Add a list of ``{"state","policy","value"}`` examples to the buffer.
+
+        Each example is copied into the preallocated arrays at the current write
+        cursor, wrapping around and overwriting the oldest data when full.
+        """
+        if self.capacity == 0:
+            return
         for example in examples:
-            self._buffer.append(example)
+            idx = self._cursor
+            self._states[idx] = np.asarray(example["state"], dtype=np.float32)
+            self._policies[idx] = np.asarray(
+                example["policy"], dtype=np.float32
+            )
+            self._values[idx, 0] = float(example["value"])
+
+            self._cursor = (self._cursor + 1) % self.capacity
+            if self._size < self.capacity:
+                self._size += 1
 
     def __len__(self) -> int:
-        return len(self._buffer)
+        return self._size
 
     def sample(
         self, batch_size: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Sample a minibatch (with replacement).
+        """Sample a minibatch uniformly with replacement.
 
         Returns ``(states (B,19,8,8), policies (B,POLICY_SIZE), values (B,1))``
-        as float32 numpy arrays.
+        as fresh float32 numpy arrays (copies, so callers may mutate them
+        freely without corrupting the buffer).
         """
-        chosen = [random.choice(self._buffer) for _ in range(batch_size)]
+        if self._size == 0:
+            raise ValueError("cannot sample from an empty ReplayBuffer")
 
-        states = np.stack(
-            [np.asarray(ex["state"], dtype=np.float32) for ex in chosen]
-        )
-        policies = np.stack(
-            [np.asarray(ex["policy"], dtype=np.float32) for ex in chosen]
-        )
-        values = np.asarray(
-            [ex["value"] for ex in chosen], dtype=np.float32
-        ).reshape(batch_size, 1)
-
+        indices = np.random.randint(0, self._size, size=batch_size)
+        states = self._states[indices].copy()
+        policies = self._policies[indices].copy()
+        values = self._values[indices].copy()
         return states, policies, values
