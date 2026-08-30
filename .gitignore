@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# alpha_chess model checkpoints
+models/
+models_smoke/
+
+# macOS
+.DS_Store
