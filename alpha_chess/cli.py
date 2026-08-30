@@ -1,10 +1,11 @@
 """Command-line interface for alpha_chess.
 
-Exposes an argparse-based CLI with three subcommands:
+Exposes an argparse-based CLI with these subcommands:
 
 * ``train``   -- run the from-scratch self-play training loop.
 * ``suggest`` -- load a trained model and print the best move for a position.
 * ``play``    -- launch the pygame GUI to play against the agent.
+* ``analyze`` -- launch the GUI directly in the board-editor / analysis mode.
 
 Both ``python -m alpha_chess.cli`` and ``python -m alpha_chess`` route here via
 :func:`main`.
@@ -93,6 +94,24 @@ def _add_play_parser(subparsers: argparse._SubParsersAction) -> None:
                    help="Human color: white|black.")
     p.add_argument("--device", type=str, default="auto",
                    help="Device preference: auto|cpu|cuda|mps.")
+    p.add_argument("--setup", action="store_true",
+                   help="Start in the board-editor / analysis (setup) mode.")
+
+
+def _add_analyze_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``analyze`` subcommand (GUI board editor + analysis)."""
+    p = subparsers.add_parser(
+        "analyze",
+        help="Open the GUI directly in the setup / analysis (board editor) mode.",
+    )
+    p.add_argument("--model", type=str, default="models/best.pt",
+                   help="Path to the trained model (optional; enables analysis).")
+    p.add_argument("--simulations", type=int, default=400,
+                   help="MCTS simulations per analysis.")
+    p.add_argument("--fen", type=str, default=None,
+                   help="Optional FEN to prefill the editor.")
+    p.add_argument("--device", type=str, default="auto",
+                   help="Device preference: auto|cpu|cuda|mps.")
 
 
 def _run_train(args: argparse.Namespace) -> None:
@@ -168,6 +187,26 @@ def _run_play(args: argparse.Namespace) -> None:
         simulations=args.simulations,
         human_color=args.color,
         device=get_device(args.device),
+        start_in_setup=args.setup,
+    )
+
+
+def _run_analyze(args: argparse.Namespace) -> None:
+    """Dispatch the ``analyze`` subcommand: open the GUI in setup mode."""
+    from alpha_chess.gui import launch_gui
+    from alpha_chess.network import get_device
+
+    model_path = args.model if args.model and os.path.isfile(args.model) else None
+    if args.model and model_path is None:
+        print("Warning: model '{}' not found; analysis disabled until a model "
+              "is loaded.".format(args.model), file=sys.stderr)
+
+    launch_gui(
+        model_path=model_path,
+        simulations=args.simulations,
+        device=get_device(args.device),
+        start_in_setup=True,
+        initial_fen=args.fen,
     )
 
 
@@ -188,6 +227,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     _add_train_parser(subparsers)
     _add_suggest_parser(subparsers)
     _add_play_parser(subparsers)
+    _add_analyze_parser(subparsers)
 
     args = parser.parse_args(argv)
 
@@ -197,6 +237,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         _run_suggest(args)
     elif args.command == "play":
         _run_play(args)
+    elif args.command == "analyze":
+        _run_analyze(args)
     else:  # pragma: no cover - argparse enforces a valid command.
         parser.error("Unknown command: {}".format(args.command))
 

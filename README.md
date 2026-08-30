@@ -15,11 +15,12 @@ trained agent or ask it for the best move in any position.
 2. [Quick start](#quick-start)
 3. [1. Train from scratch](#1-train-from-scratch)
 4. [2. Play in the GUI](#2-play-in-the-gui)
-5. [3. Suggest the best move](#3-suggest-the-best-move)
-6. [How it works](#how-it-works)
-7. [Project layout](#project-layout)
-8. [Testing](#testing)
-9. [FAQ / troubleshooting](#faq--troubleshooting)
+5. [2b. Setup & analysis mode (board editor)](#2b-setup--analysis-mode-board-editor)
+6. [3. Suggest the best move (CLI)](#3-suggest-the-best-move)
+7. [How it works](#how-it-works)
+8. [Project layout](#project-layout)
+9. [Testing](#testing)
+10. [FAQ / troubleshooting](#faq--troubleshooting)
 
 ---
 
@@ -178,10 +179,66 @@ Launch the pygame board. If `--model` is omitted or missing, the GUI runs
 - **U** — undo the last move (a full human+agent pair when playing the engine).
 - **N** — new game.
 - **F** — flip the board.
+- **E** — enter **setup / analysis mode** (board editor; see below).
 - **ESC / Q** — quit.
 
 The side panel shows whose turn it is, check/checkmate/stalemate/draw status, a
 "thinking…" indicator while the agent searches, and the latest evaluation.
+
+---
+
+## 2b. Setup & analysis mode (board editor)
+
+Set up **any** position by hand and ask the engine for the best move and a
+ranked list of candidates — re-askable after every edit. Open it directly:
+
+```bash
+.venv/bin/python -m alpha_chess.cli analyze \
+  --model models/best.pt \
+  --simulations 400 \
+  --fen "8/8/8/8/8/2k5/8/2K1Q3 w - - 0 1"   # --fen is optional
+```
+
+…or press **E** at any time in `play` mode (also `play --setup` to start there).
+Entering setup copies the current board (pieces, side to move, castling rights)
+into the editor so you can tweak the live game or start fresh.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--model` | `models/best.pt` | Checkpoint to load. Omit/missing → analysis disabled. |
+| `--simulations` | `400` | MCTS simulations per analysis. |
+| `--fen` | *(none)* | Optional FEN to prefill the editor. |
+| `--device` | `auto` | Inference device. |
+
+**Editing**
+
+- The side panel shows a **piece palette** — a row of white pieces (K Q R B N P),
+  a row of black pieces (k q r b n p), and an **eraser** cell. Click a cell to
+  pick the current *brush* (highlighted).
+- **Left-click** a board square to place the selected brush (overwriting any
+  piece); with the eraser brush selected it clears the square.
+- **Right-click** a square to erase it regardless of the brush.
+- **T** — toggle the side to move (White/Black).
+- **C** — clear the whole board.  **R** — reset to the standard start position.
+- **X** — select the eraser brush.
+- **K** — clear all castling rights. (Rights are otherwise auto-granted whenever
+  the relevant king **and** rook are on their home squares.)
+- **F** — flip the board.
+
+**Analysis**
+
+- **SPACE** or **A** — validate the position and, if legal, analyze it. The
+  best move's from/to squares are highlighted on the board and the panel shows
+  the best move (SAN + eval in `[-1, +1]`, side-to-move perspective) plus the
+  top 5 candidates with their visit-count percentages. Re-run after edits to
+  refresh. Analysis works for whichever side is to move.
+- **P** — "play from this position": if legal, adopt the edited position as a
+  fresh game and switch to `play` mode.
+- **E / ESC** — leave setup and return to `play` mode.  **Q** — quit.
+
+Invalid positions are rejected with a specific reason (missing/too many kings,
+pawns on a back rank, the side *not* to move being in check, too many pieces,
+etc.) and are never analyzed or played.
 
 ---
 
