@@ -36,13 +36,33 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--iterations", type=int, default=40,
                    help="Number of self-play/training iterations.")
-    p.add_argument("--games-per-iter", type=int, default=200,
+    p.add_argument("--games-per-iter", type=int, default=2000,
                    help="Self-play games generated per iteration.")
     p.add_argument("--simulations", type=int, default=200,
                    help="MCTS simulations per move during self-play.")
-    p.add_argument("--num-parallel-games", type=int, default=64,
-                   help="Concurrent self-play games batched into one forward "
-                        "pass per simulation step.")
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="Self-play search processes. Tree search is pure "
+                        "Python and GIL-bound, so this is the main throughput "
+                        "lever (default: CPU count - 2).")
+    p.add_argument("--games-in-flight", type=int, default=128,
+                   help="Concurrent games searched per worker. The network "
+                        "batch is num-workers x games-in-flight positions.")
+    p.add_argument("--pipeline-stages", type=int, default=None,
+                   help="Sub-pools per worker, so several inference requests "
+                        "per worker are in flight at once (default 4).")
+    p.add_argument("--resign-threshold", type=float, default=-0.90,
+                   help="Resign once the mover's best root value stays at or "
+                        "below this for two plies (raises games/hour by "
+                        "cutting off decided games).")
+    p.add_argument("--no-resign", dest="resign", action="store_false",
+                   default=True,
+                   help="Play every self-play game to the end.")
+    p.add_argument("--resign-disable-fraction", type=float, default=0.10,
+                   help="Fraction of games played out with resignation "
+                        "suppressed, to measure resign false positives.")
+    p.add_argument("--no-save-buffer", dest="save_buffer",
+                   action="store_false", default=True,
+                   help="Do not persist the replay buffer for resuming.")
     p.add_argument("--epochs", type=int, default=4,
                    help="Training epochs per iteration.")
     p.add_argument("--batch-size", type=int, default=1024,
@@ -60,7 +80,7 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
                    help="Residual block channel width.")
     p.add_argument("--blocks", type=int, default=10,
                    help="Number of residual blocks.")
-    p.add_argument("--buffer-size", type=int, default=500000,
+    p.add_argument("--buffer-size", type=int, default=2000000,
                    help="Replay buffer capacity.")
     p.add_argument("--temperature-moves", type=int, default=30,
                    help="Plies for which moves are sampled at temperature 1.")
@@ -199,7 +219,12 @@ def _run_train(args: argparse.Namespace) -> None:
         temperature_moves=args.temperature_moves,
         max_moves=args.max_moves,
         weight_decay=args.weight_decay,
-        num_parallel_games=args.num_parallel_games,
+        num_workers=args.num_workers,
+        games_in_flight=args.games_in_flight,
+        pipeline_stages=args.pipeline_stages,
+        resign_threshold=args.resign_threshold if args.resign else None,
+        resign_disable_fraction=args.resign_disable_fraction,
+        save_buffer=args.save_buffer,
         lr_final=args.lr_final,
         grad_clip=args.grad_clip,
         use_amp=args.amp,

@@ -3,11 +3,17 @@ from __future__ import annotations
 """GPU-efficient (but CPU-correct) self-play training loop for AlphaChess.
 
 Each iteration:
-  1. Generates ``games_per_iter`` self-play games with :class:`BatchedSelfPlay`
-     (one batched forward pass per simulation step across many concurrent
-     games) and appends the examples to a numpy ring :class:`ReplayBuffer`.
+  1. Generates ``games_per_iter`` self-play games with
+     :func:`~alpha_chess.batched_selfplay.generate_selfplay_data` -- worker
+     processes running the (pure-Python, GIL-bound) tree search behind a single
+     GPU-owning inference server -- and appends them to a
+     :class:`~alpha_chess.self_play.ReplayBuffer`.
   2. Optimizes the network for ``epochs`` passes against the MCTS visit
      distributions (policy cross-entropy) and game outcomes (value MSE).
+
+States cross both boundaries uint8-packed and policy targets stay sparse; they
+are expanded on the GPU, which keeps the replay buffer ~11x smaller in RAM and
+the host->device transfers correspondingly cheaper.
 
 CUDA-only fast paths (autocast fp16, GradScaler, cudnn.benchmark,
 channels_last, pinned host memory, non-blocking copies) are all guarded so
@@ -21,7 +27,9 @@ can be continued from where it left off.
 
 import math
 import os
+import queue
 import random
+import threading
 import time
 from typing import Optional
 
@@ -29,7 +37,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from alpha_chess.batched_selfplay import BatchedSelfPlay
+from alpha_chess.batched_selfplay import default_worker_count, generate_selfplay_data
+from alpha_chess.encoding import LOAD_SCALE, NUM_PLANES
 from alpha_chess.network import AlphaZeroNet, get_device, load_model, save_model
 from alpha_chess.self_play import ReplayBuffer
 
@@ -154,7 +163,12 @@ def train(
     temperature_moves: int,
     max_moves: int,
     weight_decay: float = 1e-4,
-    num_parallel_games: int = 64,
+    games_in_flight: int = 128,
+    num_workers: Optional[int] = None,
+    pipeline_stages: Optional[int] = None,
+    resign_threshold: Optional[float] = -0.90,
+    resign_disable_fraction: float = 0.10,
+    save_buffer: bool = True,
     lr_final: Optional[float] = None,
     grad_clip: float = 1.0,
     use_amp: bool = True,
@@ -182,7 +196,17 @@ def train(
         temperature_moves: Plies of temperature-1 sampling during self-play.
         max_moves: Maximum plies before a game is cut off as a draw.
         weight_decay: L2 weight decay for Adam.
-        num_parallel_games: Concurrent games per self-play wave (batch width).
+        games_in_flight: Concurrent games searched per worker process. The
+            network batch is ``num_workers * games_in_flight`` positions.
+        num_workers: Self-play search processes (default: CPU count - 2).
+        pipeline_stages: Sub-pools per worker, so several requests per worker
+            are in flight at once (default 4).
+        resign_threshold: Resign once the mover's best root value stays at or
+            below this; ``None`` plays every game to the end.
+        resign_disable_fraction: Fraction of games played out with resignation
+            suppressed, to measure the resign false-positive rate.
+        save_buffer: Persist the replay buffer alongside ``train_state.pt`` so a
+            resumed run keeps its training history.
         lr_final: Final learning rate for cosine decay (defaults to ``lr*0.1``).
         grad_clip: Max gradient norm (``<= 0`` disables clipping).
         use_amp: Enable fp16 autocast + GradScaler (CUDA only).
@@ -213,6 +237,18 @@ def train(
     amp_enabled = bool(use_amp) and use_cuda
     amp_device_type = "cuda" if use_cuda else "cpu"
     memory_format = torch.channels_last if use_cuda else torch.contiguous_format
+
+    # Self-play tree search is pure Python and GIL-bound, so it is spread over
+    # worker processes; the GPU stays in this one, serving all of them.
+    workers = default_worker_count() if num_workers is None else int(num_workers)
+    if not use_cuda:
+        workers = 1
+    print("Self-play: {w} search worker(s) x {g} games in flight "
+          "= up to {b:,} positions per forward pass".format(
+              w=workers, g=games_in_flight, b=workers * games_in_flight))
+
+    # Replay states are stored uint8-packed; this rescales them back on device.
+    load_scale = torch.from_numpy(LOAD_SCALE).to(device).view(1, NUM_PLANES, 1, 1)
 
     if lr_final is None:
         lr_final = lr * 0.1
@@ -288,6 +324,13 @@ def train(
     buffer = ReplayBuffer(capacity=buffer_size)
     best_path = os.path.join(out_dir, "best.pt")
     train_state_path = os.path.join(out_dir, "train_state.pt")
+    buffer_path = _buffer_path(out_dir)
+
+    # A resumed run that starts from an empty buffer would spend its first
+    # iterations training on one iteration's worth of games, so the buffer is
+    # restored alongside the model.
+    if resumed_state is not None and _load_replay_buffer(buffer_path, buffer):
+        print("Restored replay buffer with {n:,} positions".format(n=len(buffer)))
 
     if start_iter >= iterations:
         print(
@@ -310,38 +353,58 @@ def train(
         model.eval()
         selfplay_seed = None if seed is None else seed + 1 + i
         sp_start = time.time()
-        generator = BatchedSelfPlay(
+        batch = generate_selfplay_data(
             model,
             device,
-            num_parallel_games=num_parallel_games,
+            num_games=games_per_iter,
+            num_workers=workers,
+            games_in_flight=games_in_flight,
+            pipeline_stages=pipeline_stages,
+            use_amp=amp_enabled,
             num_simulations=simulations,
             c_puct=1.5,
             temperature_moves=temperature_moves,
             max_moves=max_moves,
+            resign_threshold=resign_threshold,
+            resign_disable_fraction=resign_disable_fraction,
             seed=selfplay_seed,
+            # A self-play phase runs for minutes; print throughput as it goes
+            # rather than leaving the run silent until it finishes.
+            verbose=True,
         )
-        examples = generator.generate(games_per_iter)
         sp_time = max(time.time() - sp_start, 1e-9)
 
-        buffer.append(examples)
-        num_positions = len(examples)
-        games_per_sec = games_per_iter / sp_time
-        positions_per_sec = num_positions / sp_time
+        buffer.append(batch)
+        stats = batch.stats
+        num_positions = len(batch)
+        played = max(stats.get("games", 0.0), 1.0)
+        evals = stats.get("evals", 0.0)
+        nn_batches = stats.get("nn_batches", 0.0)
 
         print(
-            "[iter {ii}/{it}] self-play: {g} games, {p} positions in {t:.1f}s "
-            "| {gps:.2f} games/s, {pps:.1f} pos/s | lr={lr:.2e} buffer={bs}".format(
-                ii=i + 1,
-                it=iterations,
-                g=games_per_iter,
-                p=num_positions,
-                t=sp_time,
-                gps=games_per_sec,
-                pps=positions_per_sec,
-                lr=cur_lr,
-                bs=len(buffer),
+            "[iter {ii}/{it}] self-play: {g:.0f} games, {p} positions in {t:.1f}s "
+            "| {gph:,.0f} games/h, {eps:,.0f} evals/s | mean game {ml:.0f} plies "
+            "| lr={lr:.2e} buffer={bs:,}".format(
+                ii=i + 1, it=iterations, g=played, p=num_positions, t=sp_time,
+                gph=played / sp_time * 3600.0, eps=evals / sp_time,
+                ml=stats.get("plies", 0.0) / played, lr=cur_lr, bs=len(buffer),
             )
         )
+        if nn_batches:
+            checked = stats.get("resign_checked", 0.0)
+            print(
+                "[iter {ii}/{it}]   inference: mean batch {mb:.0f}, GPU busy "
+                "{gb:.0f}% | resigned {r:.0f} games, resign false-positive "
+                "{fp}".format(
+                    ii=i + 1, it=iterations,
+                    mb=stats.get("nn_positions", 0.0) / nn_batches,
+                    gb=stats.get("gpu_seconds", 0.0) / sp_time * 100.0,
+                    r=stats.get("resigned", 0.0),
+                    fp=("{0:.1%} of {1:.0f} checked".format(
+                        stats.get("resign_false_pos", 0.0) / checked, checked)
+                        if checked else "n/a"),
+                )
+            )
 
         # ---- Optimization phase ----------------------------------------
         model.train()
@@ -351,14 +414,19 @@ def train(
             value_loss_sum = 0.0
             train_start = time.time()
 
-            for _ in range(steps):
-                states_np, policies_np, values_np = buffer.sample(batch_size)
-
-                states = _to_device(
-                    states_np, device, use_cuda, memory_format=memory_format
+            # Sampling and pinning run on a background thread so the ~5ms host
+            # gather overlaps the ~30ms GPU step instead of preceding it.
+            for packed, pol_idx, pol_val, target_value in _prefetch(
+                buffer, batch_size, steps, use_cuda
+            ):
+                states = packed.to(device, non_blocking=True).float().mul_(
+                    load_scale
                 )
-                target_policy = _to_device(policies_np, device, use_cuda)
-                target_value = _to_device(values_np, device, use_cuda)
+                if use_cuda:
+                    states = states.contiguous(memory_format=memory_format)
+                pol_idx = pol_idx.to(device, non_blocking=True)
+                pol_val = pol_val.to(device, non_blocking=True)
+                target_value = target_value.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -369,7 +437,11 @@ def train(
                 ):
                     policy_logits, value_pred = model(states)
                     log_probs = F.log_softmax(policy_logits, dim=1)
-                    policy_loss = -(target_policy * log_probs).sum(dim=1).mean()
+                    # The visit-count target is sparse, so the cross-entropy is
+                    # gathered at the visited moves rather than materializing a
+                    # dense (B, 4672) target. Padded slots carry weight 0.
+                    picked = log_probs.gather(1, pol_idx)
+                    policy_loss = -(pol_val * picked).sum(dim=1).mean()
                     value_loss = F.mse_loss(value_pred, target_value)
                     loss = policy_loss + value_loss
 
@@ -425,6 +497,8 @@ def train(
         _save_train_state(
             train_state_path, model, optimizer, i, cur_lr
         )
+        if save_buffer:
+            _save_replay_buffer(buffer_path, buffer)
         print("[iter {ii}/{it}] saved {bp} and {ts}".format(
             ii=i + 1, it=iterations, bp=best_path, ts=train_state_path))
 
@@ -444,20 +518,70 @@ def train(
     return best_path
 
 
-def _to_device(array: np.ndarray, device, use_cuda: bool, memory_format=None):
-    """Move a numpy array to ``device`` using pinned/non-blocking on CUDA."""
-    tensor = torch.from_numpy(np.ascontiguousarray(array))
-    if use_cuda:
+def _prefetch(buffer, batch_size: int, steps: int, use_cuda: bool, depth: int = 3):
+    """Yield ``steps`` pinned minibatches, sampled on a background thread.
+
+    States stay uint8-packed and policies stay sparse across the transfer; the
+    trainer expands both on the GPU. That is ~11x fewer bytes over PCIe than
+    sending dense float32 states and dense policy targets.
+    """
+    out: "queue.Queue" = queue.Queue(maxsize=depth)
+    sentinel = object()
+
+    def produce():
         try:
-            tensor = tensor.pin_memory()
-        except RuntimeError:  # pragma: no cover - already pinned / unsupported
-            pass
-        tensor = tensor.to(device, non_blocking=True)
-        if memory_format is not None and tensor.dim() == 4:
-            tensor = tensor.to(memory_format=memory_format)
-    else:
-        tensor = tensor.to(device)
-    return tensor
+            for _ in range(steps):
+                states, pol_idx, pol_val, values = buffer.sample(batch_size)
+                tensors = (
+                    torch.from_numpy(states),
+                    torch.from_numpy(pol_idx),
+                    torch.from_numpy(pol_val),
+                    torch.from_numpy(values),
+                )
+                if use_cuda:
+                    try:
+                        tensors = tuple(t.pin_memory() for t in tensors)
+                    except RuntimeError:  # pragma: no cover - unsupported host
+                        pass
+                out.put(tensors)
+        except Exception as exc:  # pragma: no cover - surfaced to the consumer
+            out.put(exc)
+            return
+        out.put(sentinel)
+
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+    while True:
+        item = out.get()
+        if item is sentinel:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+def _buffer_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "replay_buffer.npz")
+
+
+def _save_replay_buffer(path: str, buffer) -> None:
+    """Persist the replay buffer so a resumed run keeps its training history."""
+    tmp = path + ".tmp.npz"
+    np.savez(tmp, **buffer.state_dict())
+    os.replace(tmp, path)
+
+
+def _load_replay_buffer(path: str, buffer) -> bool:
+    """Restore a persisted replay buffer; return whether anything was loaded."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with np.load(path) as data:
+            buffer.load_state_dict({k: data[k] for k in data.files})
+    except (OSError, ValueError, KeyError) as exc:
+        print("Could not restore replay buffer ({e}); starting empty.".format(e=exc))
+        return False
+    return len(buffer) > 0
 
 
 def _save_train_state(path: str, model, optimizer, iteration: int, cur_lr: float) -> None:

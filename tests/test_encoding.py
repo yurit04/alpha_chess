@@ -12,11 +12,13 @@ from alpha_chess.encoding import (
     encode_board,
     move_to_index,
     index_to_move,
+    pack_state,
+    unpack_state,
 )
 
 
 def test_constants():
-    assert NUM_PLANES == 19
+    assert NUM_PLANES == 21
     assert POLICY_SIZE == 4672
     assert POLICY_SIZE == 64 * 73
 
@@ -26,13 +28,51 @@ def test_encode_board_shape_dtype():
     arr = encode_board(board)
     assert arr.shape == (NUM_PLANES, 8, 8)
     assert arr.dtype == np.float32
-    # Side-to-move plane should be all ones at the start (white to move).
-    assert np.all(arr[12] == 1.0)
-    # White king on e1 -> plane 5, row 0, col 4.
+    # Our king on e1 -> plane 5, rank 0, file 4; their king on e8 -> plane 11.
     assert arr[5, 0, 4] == 1.0
-    # Castling rights all available at start.
-    for p in (13, 14, 15, 16):
+    assert arr[11, 7, 4] == 1.0
+    # Our pawns fill rank 2.
+    assert arr[0, 1, :].sum() == 8
+    # Castling rights all available at the start.
+    for p in (12, 13, 14, 15):
         assert np.all(arr[p] == 1.0)
+    # No repetitions yet; the constant plane is all ones.
+    assert np.all(arr[18] == 0.0) and np.all(arr[19] == 0.0)
+    assert np.all(arr[20] == 1.0)
+
+
+def test_encoding_is_side_to_move_relative():
+    """A position and its colour mirror must encode identically."""
+    board = chess.Board()
+    for san in ("e4", "c5", "Nf3", "d6", "d4", "cxd4"):
+        board.push_san(san)
+    mirrored = board.mirror()
+    assert np.array_equal(
+        encode_board(board, rep_count=0), encode_board(mirrored, rep_count=0)
+    )
+    # ...and corresponding moves must land on the same policy index.
+    for move in board.legal_moves:
+        twin = chess.Move(
+            move.from_square ^ 56, move.to_square ^ 56, promotion=move.promotion
+        )
+        assert move_to_index(move, board) == move_to_index(twin, mirrored)
+
+
+def test_repetition_planes():
+    board = chess.Board()
+    assert np.all(encode_board(board, rep_count=0)[18] == 0.0)
+    assert np.all(encode_board(board, rep_count=1)[18] == 1.0)
+    assert np.all(encode_board(board, rep_count=1)[19] == 0.0)
+    assert np.all(encode_board(board, rep_count=2)[19] == 1.0)
+
+
+def test_halfmove_clock_plane_and_packing():
+    board = chess.Board("8/8/4k3/8/8/4K3/8/8 w - - 37 90")
+    arr = encode_board(board, rep_count=0)
+    assert np.allclose(arr[17], 0.37)
+    packed = pack_state(arr)
+    assert packed.dtype == np.uint8
+    assert np.allclose(unpack_state(packed), arr, atol=1e-6)
 
 
 def _check_position(board: chess.Board):
