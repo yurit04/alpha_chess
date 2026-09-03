@@ -5,9 +5,10 @@ An **AlphaZero-style, self-play chess engine** built with PyTorch and
 self-play — no human games, no opening book, no handcrafted evaluation — using a
 single residual **policy + value** neural network guided by **PUCT Monte-Carlo
 Tree Search (MCTS)**. It ships with a pygame GUI so you can play against the
-trained agent or ask it for the best move in any position, plus tooling to
-**batch self-play across many games at once** (for GPU efficiency) and an
-`evaluate` command to track playing strength as you train.
+trained agent or ask it for the best move in any position, plus a
+**multi-process self-play pipeline** — worker processes running the tree search
+behind a single GPU-owning inference server — and an `evaluate` command to track
+playing strength as you train.
 
 The defaults target a **single NVIDIA RTX 3090 (24 GB)** and a practical goal of
 reaching roughly **1500–2000 Elo** with a small-but-capable network. Everything
@@ -72,7 +73,7 @@ The examples below use `.venv/bin/python`; if you've activated the venv
 # 1) Train a TINY model fast (a few minutes on CPU) — writes models/best.pt
 .venv/bin/python -m alpha_chess.cli train \
   --iterations 3 --games-per-iter 8 --simulations 40 \
-  --num-parallel-games 8 --batch-size 64 --buffer-size 5000 \
+  --num-workers 2 --games-in-flight 4 --batch-size 64 --buffer-size 5000 \
   --channels 32 --blocks 4 --out models --seed 0
 
 # 2) See how it does against a trivial baseline
@@ -121,12 +122,12 @@ every 5 iterations):
 .venv/bin/python -m alpha_chess.cli train \
   --device auto \
   --iterations 80 \
-  --games-per-iter 512 \
-  --num-parallel-games 256 \
+  --games-per-iter 4000 \
+  --num-workers 12 --games-in-flight 128 \
   --simulations 200 \
   --epochs 4 --batch-size 1024 \
   --lr 1e-3 --channels 128 --blocks 10 \
-  --buffer-size 1000000 \
+  --buffer-size 2000000 \
   --temperature-moves 30 --max-moves 400 \
   --eval-every 5 --eval-games 40 \
   --checkpoint-every 1 \
@@ -139,7 +140,7 @@ iterations). Restores model + optimizer + iteration + RNG and continues:
 ```bash
 .venv/bin/python -m alpha_chess.cli train --resume models --out models \
   --device auto --iterations 160 \
-  --games-per-iter 512 --num-parallel-games 256 \
+  --games-per-iter 4000 --num-workers 12 --games-in-flight 128 \
   --channels 128 --blocks 10
 ```
 
@@ -180,8 +181,8 @@ best move for a game you're playing elsewhere:
 > Reaching 1500–2000 from scratch is a **long run (many hours to days)** — see
 > [training cost & expectations](#training-cost--expectations). Keep step 1 (or
 > its resume in step 2) running, and periodically run steps 3–4 to track
-> progress. `--num-parallel-games 256` fills the 3090; lower it if you hit VRAM
-> limits, raise it (e.g. 384–512) if you have headroom.
+> progress. `--num-workers 12 --games-in-flight 128` fills a 3090 paired with an
+> 8-core CPU; lower `--games-in-flight` if you hit RAM limits.
 
 ---
 
@@ -204,15 +205,16 @@ architecture from each checkpoint's stored config, so any size just works.
 ```bash
 .venv/bin/python -m alpha_chess.cli train \
   --iterations 40 \
-  --games-per-iter 200 \
+  --games-per-iter 2000 \
   --simulations 200 \
-  --num-parallel-games 64 \
+  --num-workers 12 \
+  --games-in-flight 128 \
   --epochs 4 \
   --batch-size 1024 \
   --lr 1e-3 \
   --channels 128 \
   --blocks 10 \
-  --buffer-size 500000 \
+  --buffer-size 2000000 \
   --temperature-moves 30 \
   --max-moves 400 \
   --out models \
@@ -224,9 +226,13 @@ architecture from each checkpoint's stored config, so any size just works.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--iterations` | `40` | Number of self-play → train cycles. Also the length of the cosine LR schedule. |
-| `--games-per-iter` | `200` | Self-play games generated each iteration. |
+| `--games-per-iter` | `2000` | Self-play games generated each iteration. |
 | `--simulations` | `200` | MCTS simulations per move during self-play. Higher = stronger data, slower. |
-| `--num-parallel-games` | `64` | Concurrent self-play games batched into **one** network forward pass per simulation step — the main GPU-throughput knob. |
+| `--num-workers` | ¾ of CPU count | Self-play **search processes**. Tree search is pure Python and GIL-bound, so this is the primary throughput lever. Throughput peaked at 12 on an 8-core/16-thread i9: fewer leaves cores idle waiting on the inference round trip, more just adds blocking and starves the server thread. |
+| `--games-in-flight` | `128` | Concurrent games searched **per worker**. The network sees up to `num-workers × games-in-flight` positions per forward pass. |
+| `--resign-threshold` | `-0.90` | Resign once the mover's best root value stays at or below this for two plies. `--no-resign` plays every game out. |
+| `--resign-disable-fraction` | `0.10` | Fraction of games played out with resignation suppressed, to measure the resign false-positive rate (printed each iteration). |
+| `--no-save-buffer` | off | Skip persisting the replay buffer (it is otherwise written next to `train_state.pt` so resumes keep their history). |
 | `--epochs` | `4` | Passes over the replay buffer per iteration during the learning phase. |
 | `--batch-size` | `1024` | Minibatch size for the gradient step. |
 | `--lr` | `1e-3` | Adam learning rate (initial value, before cosine decay). |
@@ -234,7 +240,7 @@ architecture from each checkpoint's stored config, so any size just works.
 | `--grad-clip` | `1.0` | Max gradient norm (`clip_grad_norm_`). |
 | `--channels` | `128` | Width of the residual tower (conv channels). Bigger = stronger, slower. |
 | `--blocks` | `10` | Number of residual blocks (depth). Bigger = stronger, slower. |
-| `--buffer-size` | `500000` | Replay buffer capacity in **positions** (numpy ring buffer; oldest evicted). |
+| `--buffer-size` | `2000000` | Replay buffer capacity in **positions** (numpy ring buffer; oldest evicted). Positions cost ~1.9 KB each, so 2M is ~3.8 GB. |
 | `--temperature-moves` | `30` | For the first N plies, moves are **sampled** from MCTS visit counts (exploration); after that the **best** move is played. |
 | `--max-moves` | `400` | Cap on plies per self-play game (cutoff scored as a draw). |
 | `--weight-decay` | `1e-4` | L2 regularization for Adam. |
@@ -261,14 +267,14 @@ extra flags to turn the GPU on.
 .venv/bin/python -m alpha_chess.cli train \
   --device auto \
   --iterations 80 \
-  --games-per-iter 512 \
+  --games-per-iter 4000 \
   --simulations 200 \
-  --num-parallel-games 256 \
+  --num-workers 12 --games-in-flight 128 \
   --epochs 4 \
   --batch-size 1024 \
   --lr 1e-3 \
   --channels 128 --blocks 10 \
-  --buffer-size 1000000 \
+  --buffer-size 2000000 \
   --temperature-moves 30 \
   --max-moves 400 \
   --eval-every 5 --eval-games 40 \
@@ -278,15 +284,24 @@ extra flags to turn the GPU on.
 
 Notes on the knobs:
 
-- **`--num-parallel-games`** is the biggest throughput lever. Every simulation
-  step evaluates *one leaf per active game*, so raising this raises the GPU
-  batch size. **256** comfortably fits a 128×10 net in the 3090's 24 GB; raise
-  to 384–512 if you have headroom, back off if you hit VRAM limits. Keep
-  `--games-per-iter` ≥ `--num-parallel-games` so each self-play wave stays full.
-  It does **not** change what is learned, only how fast games are generated.
+- **`--num-workers`** is the biggest throughput lever. MCTS is pure-Python tree
+  search and holds the GIL, so it is spread over worker *processes* that feed a
+  single GPU-owning inference server. Use roughly your core count; there is
+  little to gain past ~1.5× the number of physical cores.
+- **`--games-in-flight`** sets how many games each worker searches at once, and
+  so how wide the batched forward pass gets (`num-workers × games-in-flight`
+  positions). Wider batches are much more efficient on the GPU — a 128×10 net
+  runs at ~56k positions/s at batch 512 against ~80k at batch 1536 — but large
+  pools cost RAM and hurt cache locality, so **128** is a good middle. Neither
+  flag changes *what* is learned, only how fast games are generated.
 - **`--simulations`** trades data quality against speed; 200 is a solid default.
-- **`--buffer-size`** of ~1M positions keeps a broad, recent history in ~2–3 GB
-  of RAM (numpy ring buffer, see [replay buffer](#efficient-replay-buffer)).
+- **`--resign-threshold`** cuts decided games short, which is a large share of
+  the win at long time controls. The iteration log prints the false-positive
+  rate measured on the `--resign-disable-fraction` of games played out anyway;
+  if it climbs above ~5%, lower the threshold (e.g. `-0.95`).
+- **`--buffer-size`** of ~2M positions keeps a broad, recent history in ~3.8 GB
+  of RAM. Positions are stored uint8-packed with sparse policy targets, ~1.9 KB
+  each (see [replay buffer](#efficient-replay-buffer)).
 - **`--eval-every 5 --eval-games 40`** plays the current model against a baseline
   every 5 iterations and prints the score + estimated Elo delta, so you can
   watch progress. Evaluation is wrapped in try/except and never crashes
@@ -297,7 +312,7 @@ output directory. Point `--resume` at the file or its directory:
 
 ```bash
 .venv/bin/python -m alpha_chess.cli train --resume models --out models \
-  --iterations 60 --channels 128 --blocks 10 --num-parallel-games 128
+  --iterations 60 --channels 128 --blocks 10 --games-in-flight 128
 ```
 
 This restores the model, optimizer, iteration counter, and RNG states and
@@ -311,12 +326,30 @@ never crashes the run.
 Be realistic: reaching **1500–2000 Elo from scratch** on one 3090 takes
 **substantial wall-clock — realistically many hours to days** — and depends
 heavily on how much self-play you generate (games × moves × simulations).
-Batched self-play and AMP make the network evaluations much cheaper, but a large
-share of self-play time is the **CPU-bound legal-move generation and board logic
-in python-chess** (running the MCTS tree), which the GPU does not accelerate.
-Raising `--num-parallel-games` amortizes the GPU cost well but the CPU side
-still scales with total positions searched. Plan for a long run, checkpoint
-often, and track strength with `evaluate`. This project is a faithful, runnable
+
+Self-play is ultimately limited by **CPU-bound legal-move generation and board
+logic in python-chess** (running the MCTS tree), which the GPU does not
+accelerate; the pipeline exists to spread that work over every core and keep the
+GPU fed while it runs. On an RTX 3090 with an 8-core/16-thread i9 it sustains
+roughly **32,000–36,000 evaluated positions/s**. At 200 simulations per move
+that is on the order of **5,000–6,000 self-play games/hour**, so a few hundred
+thousand games — the rough order needed for the 1500–2000 band — is a run of
+**days, not months**.
+
+Where the time goes, measured on that machine with a 128×10 net:
+
+| | positions/s |
+|---|---|
+| Pure tree search, all workers, network stubbed out | ~80,000 |
+| Network forward pass at batch 1536 | ~80,000 |
+| Network forward pass at batch 512 | ~56,000 |
+| **End-to-end self-play** | **~35,000** |
+
+Both halves are within ~2× of the achieved rate, so the two are reasonably
+balanced: adding GPU without adding cores (or vice versa) buys little. The
+iteration log prints mean batch size and GPU-busy percentage so you can see
+which side is short on your hardware. Plan for a long run, checkpoint often, and
+track strength with `evaluate`. This project is a faithful, runnable
 *implementation* of the AlphaZero method tuned for a single GPU — not a promise
 of grandmaster strength on a laptop.
 
@@ -568,7 +601,7 @@ bootstraps from random play.
 A **dual-head residual convolutional network** (`AlphaZeroNet`), the AlphaZero
 architecture in miniature:
 
-- **Input:** a `(19, 8, 8)` tensor encoding the board (see *Encoding* below).
+- **Input:** a `(21, 8, 8)` tensor encoding the board (see *Encoding* below).
 - **Body:** a 3×3 conv **stem** (→ `channels`) + BatchNorm + ReLU, followed by
   `num_blocks` **residual blocks** (each: conv3×3 → BN → ReLU → conv3×3 → BN,
   plus a skip connection, then ReLU).
@@ -587,9 +620,18 @@ CLI) — a small-but-capable ResNet sized for the ~1500–2000 target and fast o
 
 ### Board & move encoding (`encoding.py`)
 
-- **Board → tensor:** 19 planes of 8×8 — 6 white piece types, 6 black piece
-  types, side to move, the four castling rights, the en-passant target square,
-  and a halfmove-clock plane.
+- **Board → tensor:** 21 planes of 8×8, all **side-to-move relative** — the
+  board is vertically flipped when Black is to move, so the network always sees
+  the player to move at the bottom moving "up". That halves what it has to
+  learn: a motif never has to be represented twice, once per colour. The planes
+  are 6 *our* piece types, 6 *their* piece types, our two and their two castling
+  rights, the en-passant target square, a halfmove-clock plane, two repetition
+  planes (has this position occurred once / twice before?), and a constant
+  all-ones plane that lets padded convolutions locate the board edge.
+
+  The flip is internal to `encoding.py`: `encode_board`, `move_to_index` and
+  `index_to_move` all take the board and apply (or undo) the orientation
+  themselves, so callers work in ordinary absolute `chess` coordinates.
 - **Move ↔ index:** the AlphaZero **8×8×73 = 4672** move representation. For each
   from-square, 73 planes encode 56 "queen" sliding moves (8 directions × 7
   distances), 8 knight moves, and 9 underpromotions (knight/bishop/rook × 3
@@ -618,41 +660,88 @@ search for the GUI, `suggest`, and `evaluate`.
 
 ### Batched self-play (`batched_selfplay.py`)
 
-Self-play is the wall-clock bottleneck, and evaluating one leaf at a time wastes
-the GPU. `BatchedSelfPlay` plays a **wave of many independent games at once** in
-a single process and batches their network evaluations into **one forward pass
-per simulation step** (batch size = number of active games). Because every game
-contributes exactly one in-flight leaf per step, the games are fully independent
-and **no virtual loss is needed** — the batching is purely across games.
+Self-play is the wall-clock bottleneck. The tree search is pure Python and the
+network is on the GPU, so the naive arrangement leaves the GPU almost completely
+idle: one process descends a tree on one core while the device waits. Six things
+close that gap.
 
-Per move, over a wave of up to `num_parallel_games` games: for each simulation
-step, every active game descends its own tree by PUCT to a leaf; terminal leaves
-are scored directly (checkmate `-1`, draw `0`, no network call); all non-terminal
-leaves are batch-encoded and evaluated in **one** `torch.no_grad` forward pass
-(fp16 autocast on CUDA); priors are soft-maxed over each leaf's legal moves,
-children are expanded, and the value is backed up along each path negating per
-ply. Root priors get per-game Dirichlet noise. After `num_simulations` steps each
-game picks a move from its root visit counts — **sampled** at temperature 1 for
-the first `temperature_moves` plies, **argmax** thereafter — records the training
-example, and pushes the move. When a game ends (or hits `max_moves`, scored a
-draw), its stored examples get the final result written back as the value target,
-signed for the mover at each position. Finished games leave the wave; new waves
-spawn until `num_games` are done. The output examples are **identical in meaning
-and format** to `self_play.play_game`. A convenience wrapper
-`generate_selfplay_data(network, device, num_games, **kwargs)` is also provided.
+**Many games in flight.** Every in-flight game contributes at most one leaf per
+simulation step, so a step is a single batched forward pass. Games share no
+search state, so **no virtual loss is needed** and the search semantics match a
+plain sequential PUCT search.
+
+**Worker processes behind one inference server.** Tree search holds the GIL, so
+it runs in worker *processes* that exchange positions with a single GPU-owning
+server through shared memory. The server concatenates every worker's pending
+request into one large forward pass, which matters a lot: a 128×10 net runs at
+~56k positions/s at batch 512 and ~80k at batch 1536.
+
+**A pipelined worker.** Each worker splits its games into `pipeline_stages`
+sub-pools and keeps one request per sub-pool outstanding, so it keeps searching
+while earlier requests are in flight instead of blocking on every round trip.
+
+**A double-buffered server.** The server starts a batch's forward pass, then
+finishes the *previous* batch — so while the GPU runs pass *N* the host is
+staging pass *N+1* and scattering pass *N−1*.
+
+**CUDA-graph replay.** Inference here is *host-launch bound*, not GPU bound: at
+batch 384 a 128×10 net needs ~3.2 ms of host time to issue ~3.8 ms of device
+work, and the server competes with the search workers for cores. Capturing the
+forward pass into a CUDA graph drops the issue cost to ~0.03 ms. Graphs are
+captured fresh each self-play phase, so a graph can never serve stale weights,
+and batch sizes are rounded up to a multiple of 128 to keep the number of
+captured shapes (and cuDNN's own algorithm cache) small.
+
+**O(1) draw detection.** `board.is_game_over(claim_draw=True)` costs ~159 µs
+because it replays the move stack looking for repetitions, and it used to run at
+every node of every descent. Repetition counts and the halfmove clock are now
+tracked incrementally along the descent, and terminal status is resolved only at
+a leaf, reusing the legal-move list the leaf needs anyway — 3.8 µs instead.
+
+On top of that the search **reuses the subtree** under the played move rather
+than discarding it each ply, **refills finished games** immediately so the batch
+never decays to a handful of stragglers, and **resigns** decided games (keeping
+`resign_disable_fraction` of them going to measure the false-positive rate).
+
+Per simulation, each active game descends its own tree by PUCT to a leaf;
+terminal leaves are scored directly (checkmate `-1`, draw `0`, no network call);
+non-terminal leaves are batch-encoded and evaluated in one `torch.no_grad`
+forward pass (fp16 autocast on CUDA). Priors are soft-maxed over each leaf's
+legal moves **on the device**, so only the `(B, max_legal)` gathered rows come
+back to the host rather than the full `(B, 4672)` logit matrix. Children are
+expanded and the value is backed up along the path, negating per ply. Root
+priors get per-game Dirichlet noise. Once a move's simulation budget is spent
+(visits carried over by subtree reuse count towards it) the game picks a move
+from its root visit counts — **sampled** at temperature 1 for the first
+`temperature_moves` plies, **argmax** thereafter — records the training example
+and pushes the move. When a game ends, its stored examples get the final result
+written back as the value target, signed for the mover at each position.
+
+`generate_selfplay_data(model, device, num_games, **kwargs)` is the entry point;
+`num_workers=1` runs everything in-process, which is what CPU-only machines and
+the tests use.
 
 `self_play.py` retains the original single-game `play_game` (used by tests and
 available for reference) with unchanged behavior.
 
 ### Efficient replay buffer
 
-`self_play.ReplayBuffer` is a **numpy ring buffer**: it preallocates
-`states (capacity, 19, 8, 8)`, `policies (capacity, 4672)`, and
-`values (capacity, 1)` as float32, with a write cursor and size that wrap
-around. This gives O(1) random access and a flat memory footprint (no per-sample
-Python objects). The public API is unchanged: `__init__(capacity)`,
-`append(list_of_examples)`, `__len__`, and `sample(batch_size)` returning
-`(states, policies, values)` numpy arrays sampled uniformly with replacement.
+`self_play.ReplayBuffer` is a **numpy ring buffer**, stored compactly because
+buffer size is one of the levers on final strength and a dense buffer runs out
+of RAM long before it runs out of usefulness. States are **uint8-packed** (1.3 KB
+per position instead of 5.4 KB) and policy targets are **sparse** — only the
+at-most-80 moves that actually received visits, rather than a 4672-wide float32
+row. That is ~1.9 KB per position against ~21 KB dense, so 500k positions cost
+~0.9 GB rather than ~11.7 GB. Both are expanded on the GPU by the trainer, which
+also keeps the host→device transfer ~11× smaller. It preallocates
+`states (capacity, 21, 8, 8)`, `pol_idx/pol_val (capacity, 80)`, and
+`values (capacity, 1)`, with a write cursor and size that wrap around. This
+gives O(1) appends and random access and a flat memory footprint (no per-sample
+Python objects). The API is `__init__(capacity)`, `append(SelfPlayBatch)`,
+`__len__`, `sample(batch_size)` returning `(states, pol_idx, pol_val, values)`
+sampled uniformly with replacement, and `state_dict()` / `load_state_dict()` so
+a resumed run keeps its history (a buffer saved at a different `--buffer-size`
+is truncated to the most recent positions that fit).
 
 ### The learning step (`train.py`)
 
@@ -666,13 +755,19 @@ loss = policy_loss + value_loss
      + MSE(value_pred, game_result)
 ```
 
-plus L2 weight decay. GPU-efficiency details, all guarded to be no-ops on
-CPU/MPS:
+plus L2 weight decay. The policy target is sparse, so the cross-entropy is
+gathered at the visited moves rather than materializing a dense `(B, 4672)`
+target; padded slots carry weight zero, which makes it exactly equal to the
+dense form. GPU-efficiency details, all guarded to be no-ops on CPU/MPS:
 
 - **AMP / fp16:** forward + loss run under `torch.autocast(..., float16)` on
   CUDA; a `GradScaler` handles the optimizer step. On CPU/MPS this is fp32.
 - **cudnn.benchmark**, **channels-last** model memory format, **pinned** host
   tensors, and **non-blocking** host→device copies on CUDA.
+- **Background prefetch:** minibatches are sampled and pinned on a worker
+  thread, so the host-side gather overlaps the GPU step instead of preceding it.
+  States cross the bus uint8-packed and policies sparse, and are expanded on the
+  device.
 - **Cosine LR decay** from `--lr` to `--lr-final` (default `lr*0.1`) across
   `--iterations`.
 - **Gradient clipping** to `--grad-clip`.
@@ -680,7 +775,8 @@ CPU/MPS:
 
 **Checkpoints & resume.** Every iteration mirrors the latest weights to
 `best.pt` and writes a resumable `train_state.pt` (model config + weights,
-optimizer state, iteration, and numpy/torch RNG states); numbered
+optimizer state, iteration, and numpy/torch RNG states) plus
+`replay_buffer.npz` (unless `--no-save-buffer`); numbered
 `checkpoint_{i:03d}.pt` files are written every `--checkpoint-every`. `--resume`
 on a `train_state.pt` (or its directory) restores everything and continues from
 the next iteration; on a plain model checkpoint it loads weights only and starts
@@ -708,18 +804,19 @@ move, its SAN/UCI, the value estimate, and the top candidates — this powers th
 
 ```
 alpha_chess/
-  encoding.py          board → (19,8,8) tensor and the 4672-way move ↔ index mapping
+  encoding.py          board → (21,8,8) side-to-move-relative tensor; 4672-way move ↔ index
   network.py           AlphaZeroNet (residual policy/value net), device + save/load
   mcts.py              network-guided PUCT MCTS (interactive single-position search)
-  self_play.py         single-game self-play + numpy ring-buffer ReplayBuffer
-  batched_selfplay.py  many games at once, one batched GPU forward per sim step
+  self_play.py         reference single-game self-play + compact ReplayBuffer
+  batched_selfplay.py  multi-process self-play behind one batched GPU inference server
   train.py             the batched self-play + AMP training loop (resumable)
   evaluate.py          strength evaluation: baselines, matches, Elo, UCI opponent
   agent.py             high-level agent: play_move / suggest_move
   gui.py               pygame GUI (play + advisor board + board editor)
   cli.py               train / evaluate / suggest / play / analyze command line
 tests/
-  test_encoding.py     round-trip + shape tests for the encoding
+  test_encoding.py     round-trip, mirror-invariance and packing tests for the encoding
+  test_selfplay.py     search/terminal-detection correctness and replay-buffer tests
 requirements.txt
 README.md
 ```
@@ -732,30 +829,48 @@ README.md
 .venv/bin/python -m pytest tests/ -q
 ```
 
-The tests run on CPU in fp32 (all CUDA-only fast paths are guarded off). The
-encoding tests verify constants, tensor shape/dtype, and that **every** legal
-move round-trips through `move_to_index` / `index_to_move` across openings,
-random playouts, promotions, underpromotions, castling, and en passant.
+The tests run on CPU in fp32 (all CUDA-only fast paths are guarded off).
+
+`test_encoding.py` verifies constants and tensor shape/dtype, that **every**
+legal move round-trips through `move_to_index` / `index_to_move` across
+openings, random playouts, promotions, underpromotions, castling and en
+passant, that a position and its colour mirror encode identically and map
+corresponding moves to the same policy index, and that uint8 packing is lossless.
+
+`test_selfplay.py` covers the search: that the O(1) terminal detection agrees
+with python-chess's `claim_draw` semantics (checkmate, stalemate, insufficient
+material, fifty-move, threefold) and that games the engine calls finished really
+are over; that subtree reuse carries the played move's visits into the next ply;
+that search finds a mate in one from uniform priors; the resignation rules and
+their bookkeeping; the emitted batch's invariants; and the replay buffer's ring
+wrap, oversize append and save/restore-at-a-different-capacity. It also runs the
+multi-process pipeline end to end with two workers.
 
 ---
 
 ## FAQ / troubleshooting
 
+- **My old checkpoint won't load: "trained on a 19-plane encoding".** The board
+  encoding is now side-to-move relative with repetition planes (19 → 21 planes),
+  so weights from before that change cannot be reused and `load_model` says so
+  rather than failing obscurely. Train a fresh model, or check out the revision
+  that produced the checkpoint.
 - **The engine plays random/weak moves.** Expected for a small or briefly trained
   model — the value/policy are near-untrained. Train longer with more
   `--iterations`, `--games-per-iter`, and `--simulations`; measure progress with
-  `evaluate`. Reaching 1500–2000 from scratch takes many hours to days on a 3090.
-- **How do I speed up self-play on my GPU?** Raise `--num-parallel-games` (try
-  128–256 on a 3090) to grow the batched forward pass, and keep `--amp` on
-  (default). Note self-play is partly **CPU-bound** in python-chess, so the GPU
-  cannot remove all of the cost.
+  `evaluate`. Reaching 1500–2000 from scratch is a run of days on a 3090.
+- **How do I speed up self-play?** Raise `--num-workers` toward your core count
+  — self-play is **CPU-bound** in python-chess, so cores matter more than the
+  GPU. Then raise `--games-in-flight` to widen the batched forward pass, and
+  keep `--amp` on (default). Watch the per-iteration log: if "GPU busy" is low,
+  add workers; if mean batch is small, raise `--games-in-flight`.
 - **Is mixed precision automatic?** Yes. On CUDA, `--device auto` selects the GPU
   and fp16 AMP + cudnn.benchmark + channels-last activate automatically. On
   CPU/MPS everything runs fp32. Disable AMP with `--no-amp`.
 - **How do I resume a run?** Point `--resume` at your output dir (or its
-  `train_state.pt`) — model, optimizer, iteration, and RNG resume and training
-  continues from the next iteration. Pointing it at a plain checkpoint loads
-  weights only.
+  `train_state.pt`) — model, optimizer, iteration, RNG **and the replay buffer**
+  resume, and training continues from the next iteration. Pointing it at a plain
+  checkpoint loads weights only.
 - **What does the Elo number mean?** It is **relative to the chosen opponent**,
   not an absolute rating. Anchor a comparable number with a calibrated UCI engine
   (`uci:PATH` + `--uci-elo`) or online play.
@@ -775,4 +890,3 @@ random playouts, promotions, underpromotions, castling, and en passant.
   board with suggestions disabled (you can still move both sides). Train first
   (creates `models/best.pt`) or pass an explicit `--model path/to/checkpoint.pt`.
   Paths are relative to your current directory, so run from the repo root.
-```
