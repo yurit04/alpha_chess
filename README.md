@@ -228,7 +228,7 @@ architecture from each checkpoint's stored config, so any size just works.
 | `--iterations` | `40` | Number of self-play → train cycles. Also the length of the cosine LR schedule. |
 | `--games-per-iter` | `2000` | Self-play games generated each iteration. |
 | `--simulations` | `200` | MCTS simulations per move during self-play. Higher = stronger data, slower. |
-| `--num-workers` | CPU count − 2 | Self-play **search processes**. Tree search is pure Python and GIL-bound, so this is the primary throughput lever. |
+| `--num-workers` | ¾ of CPU count | Self-play **search processes**. Tree search is pure Python and GIL-bound, so this is the primary throughput lever. Throughput peaked at 12 on an 8-core/16-thread i9: fewer leaves cores idle waiting on the inference round trip, more just adds blocking and starves the server thread. |
 | `--games-in-flight` | `128` | Concurrent games searched **per worker**. The network sees up to `num-workers × games-in-flight` positions per forward pass. |
 | `--resign-threshold` | `-0.90` | Resign once the mover's best root value stays at or below this for two plies. `--no-resign` plays every game out. |
 | `--resign-disable-fraction` | `0.10` | Fraction of games played out with resignation suppressed, to measure the resign false-positive rate (printed each iteration). |
@@ -735,11 +735,13 @@ row. That is ~1.9 KB per position against ~21 KB dense, so 500k positions cost
 ~0.9 GB rather than ~11.7 GB. Both are expanded on the GPU by the trainer, which
 also keeps the host→device transfer ~11× smaller. It preallocates
 `states (capacity, 21, 8, 8)`, `pol_idx/pol_val (capacity, 80)`, and
-`values (capacity, 1)` as float32, with a write cursor and size that wrap
-around. This gives O(1) random access and a flat memory footprint (no per-sample
-Python objects). The public API is unchanged: `__init__(capacity)`,
-`append(list_of_examples)`, `__len__`, and `sample(batch_size)` returning
-`(states, policies, values)` numpy arrays sampled uniformly with replacement.
+`values (capacity, 1)`, with a write cursor and size that wrap around. This
+gives O(1) appends and random access and a flat memory footprint (no per-sample
+Python objects). The API is `__init__(capacity)`, `append(SelfPlayBatch)`,
+`__len__`, `sample(batch_size)` returning `(states, pol_idx, pol_val, values)`
+sampled uniformly with replacement, and `state_dict()` / `load_state_dict()` so
+a resumed run keeps its history (a buffer saved at a different `--buffer-size`
+is truncated to the most recent positions that fit).
 
 ### The learning step (`train.py`)
 
@@ -753,13 +755,19 @@ loss = policy_loss + value_loss
      + MSE(value_pred, game_result)
 ```
 
-plus L2 weight decay. GPU-efficiency details, all guarded to be no-ops on
-CPU/MPS:
+plus L2 weight decay. The policy target is sparse, so the cross-entropy is
+gathered at the visited moves rather than materializing a dense `(B, 4672)`
+target; padded slots carry weight zero, which makes it exactly equal to the
+dense form. GPU-efficiency details, all guarded to be no-ops on CPU/MPS:
 
 - **AMP / fp16:** forward + loss run under `torch.autocast(..., float16)` on
   CUDA; a `GradScaler` handles the optimizer step. On CPU/MPS this is fp32.
 - **cudnn.benchmark**, **channels-last** model memory format, **pinned** host
   tensors, and **non-blocking** host→device copies on CUDA.
+- **Background prefetch:** minibatches are sampled and pinned on a worker
+  thread, so the host-side gather overlaps the GPU step instead of preceding it.
+  States cross the bus uint8-packed and policies sparse, and are expanded on the
+  device.
 - **Cosine LR decay** from `--lr` to `--lr-final` (default `lr*0.1`) across
   `--iterations`.
 - **Gradient clipping** to `--grad-clip`.
@@ -767,7 +775,8 @@ CPU/MPS:
 
 **Checkpoints & resume.** Every iteration mirrors the latest weights to
 `best.pt` and writes a resumable `train_state.pt` (model config + weights,
-optimizer state, iteration, and numpy/torch RNG states); numbered
+optimizer state, iteration, and numpy/torch RNG states) plus
+`replay_buffer.npz` (unless `--no-save-buffer`); numbered
 `checkpoint_{i:03d}.pt` files are written every `--checkpoint-every`. `--resume`
 on a `train_state.pt` (or its directory) restores everything and continues from
 the next iteration; on a plain model checkpoint it loads weights only and starts
@@ -820,19 +829,36 @@ README.md
 .venv/bin/python -m pytest tests/ -q
 ```
 
-The tests run on CPU in fp32 (all CUDA-only fast paths are guarded off). The
-encoding tests verify constants, tensor shape/dtype, and that **every** legal
-move round-trips through `move_to_index` / `index_to_move` across openings,
-random playouts, promotions, underpromotions, castling, and en passant.
+The tests run on CPU in fp32 (all CUDA-only fast paths are guarded off).
+
+`test_encoding.py` verifies constants and tensor shape/dtype, that **every**
+legal move round-trips through `move_to_index` / `index_to_move` across
+openings, random playouts, promotions, underpromotions, castling and en
+passant, that a position and its colour mirror encode identically and map
+corresponding moves to the same policy index, and that uint8 packing is lossless.
+
+`test_selfplay.py` covers the search: that the O(1) terminal detection agrees
+with python-chess's `claim_draw` semantics (checkmate, stalemate, insufficient
+material, fifty-move, threefold) and that games the engine calls finished really
+are over; that subtree reuse carries the played move's visits into the next ply;
+that search finds a mate in one from uniform priors; the resignation rules and
+their bookkeeping; the emitted batch's invariants; and the replay buffer's ring
+wrap, oversize append and save/restore-at-a-different-capacity. It also runs the
+multi-process pipeline end to end with two workers.
 
 ---
 
 ## FAQ / troubleshooting
 
+- **My old checkpoint won't load: "trained on a 19-plane encoding".** The board
+  encoding is now side-to-move relative with repetition planes (19 → 21 planes),
+  so weights from before that change cannot be reused and `load_model` says so
+  rather than failing obscurely. Train a fresh model, or check out the revision
+  that produced the checkpoint.
 - **The engine plays random/weak moves.** Expected for a small or briefly trained
   model — the value/policy are near-untrained. Train longer with more
   `--iterations`, `--games-per-iter`, and `--simulations`; measure progress with
-  `evaluate`. Reaching 1500–2000 from scratch takes many hours to days on a 3090.
+  `evaluate`. Reaching 1500–2000 from scratch is a run of days on a 3090.
 - **How do I speed up self-play?** Raise `--num-workers` toward your core count
   — self-play is **CPU-bound** in python-chess, so cores matter more than the
   GPU. Then raise `--games-in-flight` to widen the batched forward pass, and
@@ -842,9 +868,9 @@ random playouts, promotions, underpromotions, castling, and en passant.
   and fp16 AMP + cudnn.benchmark + channels-last activate automatically. On
   CPU/MPS everything runs fp32. Disable AMP with `--no-amp`.
 - **How do I resume a run?** Point `--resume` at your output dir (or its
-  `train_state.pt`) — model, optimizer, iteration, and RNG resume and training
-  continues from the next iteration. Pointing it at a plain checkpoint loads
-  weights only.
+  `train_state.pt`) — model, optimizer, iteration, RNG **and the replay buffer**
+  resume, and training continues from the next iteration. Pointing it at a plain
+  checkpoint loads weights only.
 - **What does the Elo number mean?** It is **relative to the chosen opponent**,
   not an absolute rating. Anchor a comparable number with a calibrated UCI engine
   (`uci:PATH` + `--uci-elo`) or online play.
@@ -864,4 +890,3 @@ random playouts, promotions, underpromotions, castling, and en passant.
   board with suggestions disabled (you can still move both sides). Train first
   (creates `models/best.pt`) or pass an explicit `--model path/to/checkpoint.pt`.
   Paths are relative to your current directory, so run from the repo root.
-```
