@@ -47,7 +47,7 @@ class AlphaChessAgent:
 
         The passed-in board is never mutated.
         """
-        state = encode_board(board)  # (19, 8, 8) float32
+        state = encode_board(board)  # (NUM_PLANES, 8, 8) float32
         tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)  # (1, 19, 8, 8)
         self.model.eval()
         with torch.no_grad():
