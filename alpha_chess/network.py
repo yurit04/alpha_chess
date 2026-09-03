@@ -3,8 +3,8 @@ from __future__ import annotations
 """AlphaZero-style residual network for chess.
 
 Exposes :class:`AlphaZeroNet` (a policy/value network operating on the
-19-plane board encoding) together with device selection and checkpoint
-serialization helpers.
+side-to-move-relative board encoding) together with device selection and
+checkpoint serialization helpers.
 """
 
 import os
@@ -13,6 +13,8 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from alpha_chess.encoding import NUM_PLANES, POLICY_SIZE
 
 
 class _ResidualBlock(nn.Module):
@@ -43,10 +45,10 @@ class AlphaZeroNet(nn.Module):
 
     def __init__(
         self,
-        num_planes: int = 19,
+        num_planes: int = NUM_PLANES,
         channels: int = 128,
         num_blocks: int = 10,
-        policy_size: int = 4672,
+        policy_size: int = POLICY_SIZE,
     ) -> None:
         super().__init__()
         # Preserve the construction arguments so checkpoints can rebuild the net.
@@ -127,7 +129,17 @@ def load_model(path: str, device: Optional[torch.device] = None) -> AlphaZeroNet
     if device is None:
         device = get_device()
     checkpoint = torch.load(path, map_location=device)
-    model = AlphaZeroNet(**checkpoint["config"])
+    config = dict(checkpoint["config"])
+    stored_planes = config.get("num_planes", NUM_PLANES)
+    if stored_planes != NUM_PLANES:
+        raise ValueError(
+            "{p} was trained on a {s}-plane encoding but this build uses {n} "
+            "planes, so its weights cannot be reused. Train a fresh model, or "
+            "check out the revision that produced the checkpoint.".format(
+                p=path, s=stored_planes, n=NUM_PLANES
+            )
+        )
+    model = AlphaZeroNet(**config)
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()

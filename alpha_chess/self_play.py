@@ -9,11 +9,12 @@ each visited position into a training example of the form
 """
 
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import chess
 
+from alpha_chess.batched_selfplay import MAX_POLICY_TARGETS
 from alpha_chess.encoding import (
     encode_board,
     move_to_index,
@@ -124,64 +125,123 @@ def play_game(
 class ReplayBuffer:
     """Fixed-capacity ring buffer of self-play training examples.
 
-    Storage is a set of preallocated numpy arrays (``states``, ``policies``,
-    ``values``) plus a write cursor and a running size.  Writes wrap around the
-    end of the arrays, overwriting the oldest examples once full.  This gives
-    O(1) appends and O(1) random access for sampling, and keeps memory bounded
-    and contiguous (unlike a ``deque`` of small objects).
+    Storage is column-oriented and deliberately compact, because replay-buffer
+    size is one of the levers on final playing strength and a dense buffer runs
+    out of RAM long before it runs out of usefulness:
+
+    * states are uint8-packed (1.3 KB per position instead of 5.4 KB, see
+      :func:`alpha_chess.encoding.pack_state`);
+    * policy targets are sparse -- the at-most-``MAX_POLICY_TARGETS`` moves that
+      actually received visits, rather than a 4672-wide float32 row.
+
+    Together that is ~1.9 KB per position against ~21 KB dense, so 500k
+    positions cost ~0.9 GB rather than ~11.7 GB.
+
+    Appends are vectorized ring writes and sampling is a single fancy-index
+    gather, both O(batch).
     """
 
     def __init__(self, capacity: int = 100000):
         self.capacity = int(capacity)
-        # Preallocated contiguous storage for each field.
         self._states = np.zeros(
-            (self.capacity, NUM_PLANES, 8, 8), dtype=np.float32
+            (self.capacity, NUM_PLANES, 8, 8), dtype=np.uint8
         )
-        self._policies = np.zeros(
-            (self.capacity, POLICY_SIZE), dtype=np.float32
+        self._pol_idx = np.zeros(
+            (self.capacity, MAX_POLICY_TARGETS), dtype=np.uint16
+        )
+        self._pol_val = np.zeros(
+            (self.capacity, MAX_POLICY_TARGETS), dtype=np.float32
         )
         self._values = np.zeros((self.capacity, 1), dtype=np.float32)
-        # Position of the next write and number of valid entries.
         self._cursor = 0
         self._size = 0
 
-    def append(self, examples: List[dict]) -> None:
-        """Add a list of ``{"state","policy","value"}`` examples to the buffer.
+    def append(self, batch) -> None:
+        """Append a :class:`~alpha_chess.batched_selfplay.SelfPlayBatch`.
 
-        Each example is copied into the preallocated arrays at the current write
-        cursor, wrapping around and overwriting the oldest data when full.
+        Writes wrap around the end of the storage, overwriting the oldest
+        positions once full.  If ``batch`` is larger than the whole buffer only
+        its most recent ``capacity`` positions are kept.
         """
-        if self.capacity == 0:
+        n = len(batch)
+        if self.capacity == 0 or n == 0:
             return
-        for example in examples:
-            idx = self._cursor
-            self._states[idx] = np.asarray(example["state"], dtype=np.float32)
-            self._policies[idx] = np.asarray(
-                example["policy"], dtype=np.float32
-            )
-            self._values[idx, 0] = float(example["value"])
 
-            self._cursor = (self._cursor + 1) % self.capacity
-            if self._size < self.capacity:
-                self._size += 1
+        states, pol_idx = batch.states, batch.pol_idx
+        pol_val, values = batch.pol_val, batch.values
+        if n > self.capacity:
+            states = states[n - self.capacity:]
+            pol_idx = pol_idx[n - self.capacity:]
+            pol_val = pol_val[n - self.capacity:]
+            values = values[n - self.capacity:]
+            n = self.capacity
+
+        start = self._cursor
+        first = min(n, self.capacity - start)
+        self._write(start, states[:first], pol_idx[:first],
+                    pol_val[:first], values[:first])
+        rest = n - first
+        if rest:
+            self._write(0, states[first:], pol_idx[first:],
+                        pol_val[first:], values[first:])
+
+        self._cursor = (start + n) % self.capacity
+        self._size = min(self._size + n, self.capacity)
+
+    def _write(self, at, states, pol_idx, pol_val, values) -> None:
+        end = at + states.shape[0]
+        self._states[at:end] = states
+        self._pol_idx[at:end] = pol_idx
+        self._pol_val[at:end] = pol_val
+        self._values[at:end, 0] = values
 
     def __len__(self) -> int:
         return self._size
 
-    def sample(
-        self, batch_size: int
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, batch_size: int):
         """Sample a minibatch uniformly with replacement.
 
-        Returns ``(states (B,19,8,8), policies (B,POLICY_SIZE), values (B,1))``
-        as fresh float32 numpy arrays (copies, so callers may mutate them
-        freely without corrupting the buffer).
+        Returns ``(states_uint8 (B, NUM_PLANES, 8, 8), pol_idx (B, K) int64,
+        pol_val (B, K) float32, values (B, 1) float32)``.  States stay packed
+        and policies stay sparse; both are expanded on the GPU by the trainer,
+        which keeps the host->device transfer ~11x smaller.
         """
         if self._size == 0:
             raise ValueError("cannot sample from an empty ReplayBuffer")
-
         indices = np.random.randint(0, self._size, size=batch_size)
-        states = self._states[indices].copy()
-        policies = self._policies[indices].copy()
-        values = self._values[indices].copy()
-        return states, policies, values
+        return (
+            self._states[indices],
+            self._pol_idx[indices].astype(np.int64),
+            self._pol_val[indices],
+            self._values[indices],
+        )
+
+    def state_dict(self) -> dict:
+        """Serializable snapshot of the buffer's live contents."""
+        return {
+            "capacity": self.capacity,
+            "cursor": self._cursor,
+            "size": self._size,
+            "states": self._states[:self._size],
+            "pol_idx": self._pol_idx[:self._size],
+            "pol_val": self._pol_val[:self._size],
+            "values": self._values[:self._size],
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore a snapshot written by :meth:`state_dict`.
+
+        A buffer saved at a different capacity is truncated to the most recent
+        positions that fit, so ``--buffer-size`` can be changed across resumes.
+        """
+        size = int(state.get("size", 0))
+        if size == 0:
+            self._cursor, self._size = 0, 0
+            return
+        keep = min(size, self.capacity)
+        self._states[:keep] = state["states"][size - keep:]
+        self._pol_idx[:keep] = state["pol_idx"][size - keep:]
+        self._pol_val[:keep] = state["pol_val"][size - keep:]
+        self._values[:keep] = state["values"][size - keep:]
+        self._size = keep
+        self._cursor = keep % self.capacity
