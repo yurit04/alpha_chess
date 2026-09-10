@@ -3,3 +3,8 @@ python-chess>=1.11
 numpy>=1.24
 pygame>=2.6
 pytest>=7.0
+# Self-play runs its tree search in a small C extension that is compiled on
+# first use (alpha_chess/native/). Any system C compiler will do; ziglang is a
+# pip-installable one, so hosts without cc/gcc/clang -- and without root to
+# install one -- still get the fast path instead of the Python fallback.
+ziglang>=0.11

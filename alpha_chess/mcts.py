@@ -5,6 +5,13 @@ AlphaZero paper.  The search is driven by a policy/value network: the policy
 provides prior probabilities over legal moves and the value provides a scalar
 evaluation of a leaf position from the perspective of the side to move.
 
+This is the *interactive* search -- one position at a time -- used by the GUI,
+``suggest`` and ``evaluate``.  Self-play uses the batched engines instead (see
+:mod:`alpha_chess.native_selfplay`), which is why this one optimises for
+latency rather than throughput: a simulation here is a single batch-of-one
+forward pass, so the cost is dominated by how quickly the host can issue it and
+by how much python-chess work surrounds it.
+
 Public symbols:
     Node   -- internal search-tree node (exposed for testing/inspection).
     MCTS   -- the search driver (run / best_move).
@@ -19,7 +26,8 @@ import chess
 import numpy as np
 import torch
 
-from alpha_chess.encoding import encode_board, move_to_index, POLICY_SIZE, NUM_PLANES
+from alpha_chess.batched_selfplay import _GraphedNetwork
+from alpha_chess.encoding import encode_board, move_to_index
 from alpha_chess.network import get_device
 
 
@@ -43,6 +51,12 @@ class Node:
     def __init__(self, prior: float = 0.0) -> None:
         self.prior: float = prior          # prior of the edge leading into this node
         self.is_expanded: bool = False
+        # None while the node is a normal (non-terminal) position; otherwise
+        # the exact game-theoretic value from the side-to-move's perspective.
+        # Resolving this once per node, at the leaf, replaces an
+        # ``is_game_over(claim_draw=True)`` call (~164us) at every node of
+        # every descent.
+        self.terminal_value: Optional[float] = None
         self.children: Dict[chess.Move, "Node"] = {}
         # Per-child aggregate statistics.
         self.child_N: Dict[chess.Move, int] = {}
@@ -78,6 +92,7 @@ class MCTS:
         c_puct: float = 1.5,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        use_amp: bool = True,
     ) -> None:
         self.network = network
         self.device = device if device is not None else get_device()
@@ -88,10 +103,28 @@ class MCTS:
         self.network.to(self.device)
         self.network.eval()
 
+        self._cuda = self.device.type == "cuda"
+        if self._cuda:
+            self.network = self.network.to(memory_format=torch.channels_last)
+        # A batch-of-one forward pass is entirely host-launch bound: ~23 tiny
+        # convolutions cost ~3.1ms to issue and microseconds to run. Replaying
+        # a captured graph issues the whole thing in one call -- 0.67ms per
+        # simulation including the result read-back, ~4.6x faster.
+        #
+        # The graph bakes in the weights it was captured with, which is correct
+        # here because an MCTS owns a loaded, frozen model; rebuild the MCTS if
+        # you swap the weights underneath it.
+        # Off CUDA there is no graph to capture, and the wrapper would drag a
+        # disabled cuda-autocast context into every simulation.
+        self._net = (
+            _GraphedNetwork(torch, self.network, self.device, bool(use_amp), True)
+            if self._cuda else self.network
+        )
+
     # ------------------------------------------------------------------ #
     # Network evaluation
     # ------------------------------------------------------------------ #
-    def _evaluate(self, board: chess.Board):
+    def _evaluate(self, board: chess.Board, legal_moves: Optional[List] = None):
         """Run a single-position network evaluation.
 
         Returns a tuple ``(priors, value)`` where ``priors`` is a dict mapping
@@ -99,44 +132,53 @@ class MCTS:
         probability, and ``value`` is a Python float in ``[-1, 1]`` giving the
         network's evaluation of ``board`` from the perspective of the side to
         move.  The passed-in board is never mutated.
+
+        ``legal_moves`` may be supplied when the caller has already generated
+        it.  The softmax is restricted to the legal moves *on the device* and
+        the value is concatenated onto it, so one small transfer -- and so one
+        synchronisation -- serves the whole call.
         """
+        if legal_moves is None:
+            legal_moves = list(board.legal_moves)
+
         state = encode_board(board)  # (NUM_PLANES, 8, 8) float32
         tensor = torch.from_numpy(np.asarray(state, dtype=np.float32))
         tensor = tensor.unsqueeze(0).to(self.device)  # (1, NUM_PLANES, 8, 8)
+        if self._cuda:
+            tensor = tensor.contiguous(memory_format=torch.channels_last)
 
-        with torch.no_grad():
-            policy_logits, value = self.network(tensor)
-
-        policy_logits = policy_logits.squeeze(0).detach().cpu().numpy()  # (POLICY_SIZE,)
-        value_scalar = float(value.squeeze().item())
-
-        legal_moves = list(board.legal_moves)
         priors: Dict[chess.Move, float] = {}
-        if legal_moves:
-            indices = np.array(
-                [move_to_index(m, board) for m in legal_moves], dtype=np.int64
-            )
-            legal_logits = policy_logits[indices]
-            # Numerically stable softmax over the legal-move logits only.
-            legal_logits = legal_logits - np.max(legal_logits)
-            exps = np.exp(legal_logits)
-            probs = exps / np.sum(exps)
-            for move, p in zip(legal_moves, probs):
-                priors[move] = float(p)
+        with torch.no_grad():
+            policy_logits, value = self._net(tensor)
+            if legal_moves:
+                indices = torch.as_tensor(
+                    [move_to_index(m, board) for m in legal_moves],
+                    dtype=torch.long, device=self.device,
+                )
+                legal_logits = policy_logits[0].index_select(0, indices).float()
+                merged = torch.cat(
+                    [torch.softmax(legal_logits, dim=0), value.float().view(1)]
+                ).cpu().numpy()
+                for move, p in zip(legal_moves, merged[:-1]):
+                    priors[move] = float(p)
+                value_scalar = float(merged[-1])
+            else:
+                value_scalar = float(value.float().view(-1)[0].item())
 
         return priors, value_scalar
 
     # ------------------------------------------------------------------ #
     # Expansion
     # ------------------------------------------------------------------ #
-    def _expand(self, node: Node, board: chess.Board) -> float:
+    def _expand(self, node: Node, board: chess.Board,
+                legal_moves: Optional[List] = None) -> float:
         """Expand ``node`` for ``board`` and return the leaf value.
 
         The returned value is the network's evaluation of ``board`` from the
         perspective of the side to move at ``board`` (i.e. at ``node``).  The
         board is not mutated.
         """
-        priors, value = self._evaluate(board)
+        priors, value = self._evaluate(board, legal_moves)
         for move, prior in priors.items():
             child = Node(prior=prior)
             node.children[move] = child
@@ -193,18 +235,24 @@ class MCTS:
     # Terminal handling
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _terminal_value(board: chess.Board) -> float:
-        """Return the game-theoretic value of a terminal ``board``.
+    def _resolve_terminal(board: chess.Board, legal_moves: List) -> Optional[float]:
+        """Terminal value from the side-to-move's view, or ``None`` if in play.
 
-        Value is from the perspective of the side to move at ``board``.  In
-        chess the side to move can never be the winner: checkmate means the
-        side to move has been mated (value -1.0); every other terminal
-        outcome (stalemate, insufficient material, repetition, 50-move) is a
-        draw (value 0.0).
+        ``legal_moves`` is the caller's already-generated list, so this adds no
+        move generation of its own.  It is the same rule set the self-play
+        engines apply (``is_game_over(claim_draw=True)`` additionally treats a
+        position from which a repetition *can be forced* as drawn, and pays for
+        it by trying every legal move).
         """
-        if board.is_checkmate():
-            return -1.0
-        return 0.0
+        if not legal_moves:
+            return -1.0 if board.is_check() else 0.0
+        if board.halfmove_clock >= 100:
+            return 0.0
+        if board.is_repetition(3):
+            return 0.0
+        if board.is_insufficient_material():
+            return 0.0
+        return None
 
     # ------------------------------------------------------------------ #
     # A single simulation
@@ -220,8 +268,9 @@ class MCTS:
         path: List[tuple] = []  # list of (parent_node, move) edges traversed
         pushed = 0
 
-        # --- Selection: descend until we hit a leaf or a terminal node. ---
-        while node.is_expanded and not board.is_game_over(claim_draw=True):
+        # --- Selection: descend until we hit a leaf. Expanded nodes are known
+        # non-terminal by construction, so the descent costs no rule checks. ---
+        while node.is_expanded:
             move = self._select_child(node)
             path.append((node, move))
             board.push(move)
@@ -229,12 +278,19 @@ class MCTS:
             node = node.children[move]
 
         # --- Evaluate the leaf. ---
-        if board.is_game_over(claim_draw=True):
-            # Terminal position: use the exact game-theoretic value.
-            value = self._terminal_value(board)
+        if node.terminal_value is not None:
+            value = node.terminal_value
         else:
-            # Non-terminal leaf: expand and use the network evaluation.
-            value = self._expand(node, board)
+            legal_moves = list(board.legal_moves)
+            terminal = self._resolve_terminal(board, legal_moves)
+            if terminal is not None:
+                # Terminal position: use the exact game-theoretic value, and
+                # remember it so later descents stop here for free.
+                node.terminal_value = terminal
+                value = terminal
+            else:
+                # Non-terminal leaf: expand and use the network evaluation.
+                value = self._expand(node, board, legal_moves)
 
         # ``value`` is from the perspective of the player to move at the leaf.
         # --- Backup: walk back up the path, negating at each ply. ---
@@ -270,8 +326,9 @@ class MCTS:
         root = Node()
 
         # Expand the root once so it has children (and priors) before search.
-        if not board.is_game_over(claim_draw=True):
-            self._expand(root, board)
+        root_legal = list(board.legal_moves)
+        if self._resolve_terminal(board, root_legal) is None:
+            self._expand(root, board, root_legal)
             if add_noise:
                 self._add_dirichlet_noise(root)
 

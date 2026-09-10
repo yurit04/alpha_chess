@@ -3,13 +3,19 @@ from __future__ import annotations
 """GPU-efficient (but CPU-correct) self-play training loop for AlphaChess.
 
 Each iteration:
-  1. Generates ``games_per_iter`` self-play games with
-     :func:`~alpha_chess.batched_selfplay.generate_selfplay_data` -- worker
-     processes running the (pure-Python, GIL-bound) tree search behind a single
-     GPU-owning inference server -- and appends them to a
-     :class:`~alpha_chess.self_play.ReplayBuffer`.
+  1. Generates ``games_per_iter`` self-play games and appends them to a
+     :class:`~alpha_chess.self_play.ReplayBuffer`.  Two engines can do this:
+     the **native** core (:mod:`alpha_chess.native_selfplay`), which runs the
+     whole tree search in C in this process, and the pure-Python fallback
+     (:func:`~alpha_chess.batched_selfplay.generate_selfplay_data`), which
+     spreads its GIL-bound search over worker processes behind a GPU-owning
+     inference server.  The native core is ~3.8x faster and is used whenever
+     it can be built.
   2. Optimizes the network for ``epochs`` passes against the MCTS visit
-     distributions (policy cross-entropy) and game outcomes (value MSE).
+     distributions (policy cross-entropy) and game outcomes (value MSE).  The
+     number of gradient steps is sized from how much *new* data the iteration
+     produced (``sample_reuse``), so the optimizer's share of the wall clock
+     does not drift as the replay buffer fills.
 
 States cross both boundaries uint8-packed and policy targets stay sparse; they
 are expanded on the GPU, which keeps the replay buffer ~11x smaller in RAM and
@@ -37,6 +43,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from alpha_chess import native, native_selfplay
 from alpha_chess.batched_selfplay import default_worker_count, generate_selfplay_data
 from alpha_chess.encoding import LOAD_SCALE, NUM_PLANES
 from alpha_chess.network import AlphaZeroNet, get_device, load_model, save_model
@@ -149,6 +156,43 @@ def _as_byte_tensor(state) -> torch.Tensor:
     return torch.as_tensor(state, dtype=torch.uint8)
 
 
+def _resolve_engine(engine: str) -> bool:
+    """True when self-play should run on the native core."""
+    choice = (engine or "auto").lower()
+    if choice == "python":
+        return False
+    if choice == "native":
+        return native.available()
+    if choice != "auto":
+        raise ValueError(
+            "unknown engine {e!r}; expected auto, native or python".format(e=engine)
+        )
+    return native.available()
+
+
+def _train_steps(train_steps, sample_reuse, new_positions, buffer_size,
+                 batch_size, epochs):
+    """Gradient steps per epoch for one iteration.
+
+    Drawing ``new_positions * sample_reuse`` samples per iteration means each
+    position is sampled ``sample_reuse`` times over its life in the buffer: it
+    survives ``buffer_size / new_positions`` iterations, and over that span the
+    draws total ``buffer_size * sample_reuse`` across ``buffer_size`` positions.
+
+    The point is that the work then scales with the *data*.  The old rule
+    (``buffer_size // batch_size`` steps per epoch) scaled with the buffer
+    instead: 7,812 steps an iteration at a 2M buffer and batch 1024, whether
+    that iteration produced 50k new positions or 800k.
+    """
+    epochs = max(1, int(epochs))
+    if train_steps and train_steps > 0:
+        return max(1, int(train_steps) // epochs)
+    if sample_reuse and sample_reuse > 0:
+        total = new_positions * float(sample_reuse) / float(batch_size)
+        return max(1, int(round(total / epochs)))
+    return max(1, buffer_size // batch_size)
+
+
 def train(
     iterations: int,
     games_per_iter: int,
@@ -166,6 +210,13 @@ def train(
     games_in_flight: int = 128,
     num_workers: Optional[int] = None,
     pipeline_stages: Optional[int] = None,
+    engine: str = "auto",
+    pools: Optional[int] = None,
+    fast_simulations: int = 50,
+    full_search_prob: float = 0.25,
+    fpu_reduction: float = 0.0,
+    sample_reuse: float = 4.0,
+    train_steps: int = 0,
     resign_threshold: Optional[float] = -0.90,
     resign_disable_fraction: float = 0.10,
     save_buffer: bool = True,
@@ -196,11 +247,30 @@ def train(
         temperature_moves: Plies of temperature-1 sampling during self-play.
         max_moves: Maximum plies before a game is cut off as a draw.
         weight_decay: L2 weight decay for Adam.
-        games_in_flight: Concurrent games searched per worker process. The
-            network batch is ``num_workers * games_in_flight`` positions.
-        num_workers: Self-play search processes (default: CPU count - 2).
+        games_in_flight: Concurrent games searched per native pool (or per
+            Python worker process). This is the network's batch size.
+        num_workers: Self-play search processes for the Python engine
+            (default: CPU count - 2). Unused by the native engine.
         pipeline_stages: Sub-pools per worker, so several requests per worker
-            are in flight at once (default 4).
+            are in flight at once (default 4). Python engine only.
+        engine: ``auto`` (native when it builds, else Python), ``native`` or
+            ``python``.
+        pools: Independent native game pools. One pool's descent overlaps the
+            next pool's forward pass, so 2 is the minimum useful value
+            (default 3).
+        fast_simulations: Simulation budget for non-recorded plies under
+            playout-cap randomisation (native engine only).
+        full_search_prob: Probability that a ply gets the full ``simulations``
+            budget, root noise and a recorded training target. ``1.0`` searches
+            every ply fully, which is the classic AlphaZero behaviour.
+        fpu_reduction: First-play-urgency penalty for unvisited children
+            (native engine only); ``0.0`` reproduces the Python engine.
+        sample_reuse: Expected number of times each position is sampled over
+            its lifetime in the replay buffer. Sets the gradient-step count;
+            ``0`` restores the old "one pass over the whole replay buffer per
+            epoch" rule.
+        train_steps: Explicit gradient steps per iteration (0 = derive them
+            from ``sample_reuse``).
         resign_threshold: Resign once the mover's best root value stays at or
             below this; ``None`` plays every game to the end.
         resign_disable_fraction: Fraction of games played out with resignation
@@ -238,14 +308,37 @@ def train(
     amp_device_type = "cuda" if use_cuda else "cpu"
     memory_format = torch.channels_last if use_cuda else torch.contiguous_format
 
-    # Self-play tree search is pure Python and GIL-bound, so it is spread over
-    # worker processes; the GPU stays in this one, serving all of them.
+    # Pick the self-play engine. The native core's search saturates a 3090 from
+    # a fraction of one core, so it needs neither worker processes nor shared
+    # memory; the Python engine spreads its GIL-bound search over processes.
+    use_native = _resolve_engine(engine)
     workers = default_worker_count() if num_workers is None else int(num_workers)
     if not use_cuda:
         workers = 1
-    print("Self-play: {w} search worker(s) x {g} games in flight "
-          "= up to {b:,} positions per forward pass".format(
-              w=workers, g=games_in_flight, b=workers * games_in_flight))
+    native_pools = native_selfplay.default_pools() if pools is None else int(pools)
+    # A "fast" ply that costs more than a full one would be nonsense.
+    fast_simulations = max(1, min(int(fast_simulations), int(simulations)))
+    if use_native:
+        print("Self-play: native core, {p} pool{s} x {g} games in flight "
+              "= up to {b:,} positions per forward pass".format(
+                  p=native_pools, s="" if native_pools == 1 else "s",
+                  g=games_in_flight, b=native_pools * games_in_flight))
+        if full_search_prob < 1.0:
+            print("           playout-cap randomisation: {f:.0%} of plies get "
+                  "{s} simulations and a training target, the rest {q}".format(
+                      f=full_search_prob, s=simulations, q=fast_simulations))
+    else:
+        print("Self-play: Python engine, {w} search worker(s) x {g} games in "
+              "flight = up to {b:,} positions per forward pass".format(
+                  w=workers, g=games_in_flight, b=workers * games_in_flight))
+        if engine == "native":
+            print("           (native core requested but unavailable: {e})"
+                  .format(e=native.last_error()))
+        if full_search_prob < 1.0:
+            print("           note: playout-cap randomisation and "
+                  "--fpu-reduction are native-engine features and are not "
+                  "applied here; every ply gets {s} simulations.".format(
+                      s=simulations))
 
     # Replay states are stored uint8-packed; this rescales them back on device.
     load_scale = torch.from_numpy(LOAD_SCALE).to(device).view(1, NUM_PLANES, 1, 1)
@@ -353,13 +446,9 @@ def train(
         model.eval()
         selfplay_seed = None if seed is None else seed + 1 + i
         sp_start = time.time()
-        batch = generate_selfplay_data(
-            model,
-            device,
+        common = dict(
             num_games=games_per_iter,
-            num_workers=workers,
             games_in_flight=games_in_flight,
-            pipeline_stages=pipeline_stages,
             use_amp=amp_enabled,
             num_simulations=simulations,
             c_puct=1.5,
@@ -372,6 +461,19 @@ def train(
             # rather than leaving the run silent until it finishes.
             verbose=True,
         )
+        if use_native:
+            batch = native_selfplay.generate_selfplay_data_native(
+                model, device, pools=native_pools,
+                fast_simulations=fast_simulations,
+                full_search_prob=full_search_prob,
+                fpu_reduction=fpu_reduction,
+                **common
+            )
+        else:
+            batch = generate_selfplay_data(
+                model, device, num_workers=workers,
+                pipeline_stages=pipeline_stages, **common
+            )
         sp_time = max(time.time() - sp_start, 1e-9)
 
         buffer.append(batch)
@@ -387,18 +489,29 @@ def train(
             "| lr={lr:.2e} buffer={bs:,}".format(
                 ii=i + 1, it=iterations, g=played, p=num_positions, t=sp_time,
                 gph=played / sp_time * 3600.0, eps=evals / sp_time,
-                ml=stats.get("plies", 0.0) / played, lr=cur_lr, bs=len(buffer),
+                ml=(stats.get("full_plies", 0.0) + stats.get("fast_plies", 0.0)
+                    or stats.get("plies", 0.0)) / played,
+                lr=cur_lr, bs=len(buffer),
             )
         )
         if nn_batches:
             checked = stats.get("resign_checked", 0.0)
+            # The native driver reports the host's own split (time spent in the
+            # search vs. blocked on the device); the Python server reports how
+            # much of the phase the device was busy for.
+            if use_native:
+                busy = "search {s:.0f}% waiting-on-GPU {g:.0f}%".format(
+                    s=stats.get("search_seconds", 0.0) / sp_time * 100.0,
+                    g=stats.get("gpu_seconds", 0.0) / sp_time * 100.0,
+                )
+            else:
+                busy = "GPU busy {g:.0f}%".format(
+                    g=stats.get("gpu_seconds", 0.0) / sp_time * 100.0)
             print(
-                "[iter {ii}/{it}]   inference: mean batch {mb:.0f}, GPU busy "
-                "{gb:.0f}% | resigned {r:.0f} games, resign false-positive "
-                "{fp}".format(
+                "[iter {ii}/{it}]   inference: mean batch {mb:.0f}, {b} | "
+                "resigned {r:.0f} games, resign false-positive {fp}".format(
                     ii=i + 1, it=iterations,
-                    mb=stats.get("nn_positions", 0.0) / nn_batches,
-                    gb=stats.get("gpu_seconds", 0.0) / sp_time * 100.0,
+                    mb=stats.get("nn_positions", 0.0) / nn_batches, b=busy,
                     r=stats.get("resigned", 0.0),
                     fp=("{0:.1%} of {1:.0f} checked".format(
                         stats.get("resign_false_pos", 0.0) / checked, checked)
@@ -408,10 +521,15 @@ def train(
 
         # ---- Optimization phase ----------------------------------------
         model.train()
+        steps = _train_steps(
+            train_steps, sample_reuse, num_positions, len(buffer),
+            batch_size, epochs,
+        )
         for epoch in range(epochs):
-            steps = max(1, len(buffer) // batch_size)
-            policy_loss_sum = 0.0
-            value_loss_sum = 0.0
+            # Losses accumulate on the device: reading them per step with
+            # .item() would synchronise on every iteration and serialise the
+            # host against the GPU it is trying to keep fed.
+            loss_totals = torch.zeros(2, device=device)
             train_start = time.time()
 
             # Sampling and pinning run on a background thread so the ~5ms host
@@ -454,12 +572,13 @@ def train(
                 scaler.step(optimizer)
                 scaler.update()
 
-                policy_loss_sum += float(policy_loss.item())
-                value_loss_sum += float(value_loss.item())
+                loss_totals[0] += policy_loss.detach()
+                loss_totals[1] += value_loss.detach()
 
+            totals = loss_totals.tolist()
             train_time = max(time.time() - train_start, 1e-9)
-            mean_policy = policy_loss_sum / steps
-            mean_value = value_loss_sum / steps
+            mean_policy = totals[0] / steps
+            mean_value = totals[1] / steps
             steps_per_sec = steps / train_time
             print(
                 "[iter {ii}/{it}] epoch {ep}/{eps}: "
