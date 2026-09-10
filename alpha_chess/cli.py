@@ -36,20 +36,51 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--iterations", type=int, default=40,
                    help="Number of self-play/training iterations.")
-    p.add_argument("--games-per-iter", type=int, default=2000,
+    p.add_argument("--games-per-iter", type=int, default=4000,
                    help="Self-play games generated per iteration.")
     p.add_argument("--simulations", type=int, default=200,
                    help="MCTS simulations per move during self-play.")
+    p.add_argument("--engine", choices=("auto", "native", "python"),
+                   default="auto",
+                   help="Self-play engine: the native C core (~4x faster, "
+                        "built on demand) or the pure-Python fallback. "
+                        "'auto' uses native whenever it can be built.")
+    p.add_argument("--pools", type=int, default=None,
+                   help="Independent native game pools. One pool's tree "
+                        "search overlaps the next pool's forward pass "
+                        "(default 3). Native engine only.")
     p.add_argument("--num-workers", type=int, default=None,
-                   help="Self-play search processes. Tree search is pure "
-                        "Python and GIL-bound, so this is the main throughput "
-                        "lever (default: CPU count - 2).")
-    p.add_argument("--games-in-flight", type=int, default=128,
-                   help="Concurrent games searched per worker. The network "
-                        "batch is num-workers x games-in-flight positions.")
+                   help="Self-play search processes for the PYTHON engine. "
+                        "Its tree search is GIL-bound, so this is that "
+                        "engine's main throughput lever (default: CPU count "
+                        "- 2). Unused by the native engine.")
+    p.add_argument("--games-in-flight", type=int, default=1024,
+                   help="Concurrent games searched per pool (native) or per "
+                        "worker (Python). The network batch is that many "
+                        "positions per pool/worker. The default suits the "
+                        "native engine; with --engine python use ~128, since "
+                        "each worker stages its own buffer.")
     p.add_argument("--pipeline-stages", type=int, default=None,
                    help="Sub-pools per worker, so several inference requests "
-                        "per worker are in flight at once (default 4).")
+                        "per worker are in flight at once (default 4). "
+                        "Python engine only.")
+    p.add_argument("--fast-simulations", type=int, default=50,
+                   help="Simulation budget for plies that playout-cap "
+                        "randomisation does not search fully (native engine "
+                        "only).")
+    p.add_argument("--full-search-prob", type=float, default=0.25,
+                   help="Probability that a ply gets the full --simulations "
+                        "budget, root noise and a recorded training target. "
+                        "Lower spends the budget on more games instead of "
+                        "deeper searches (native engine only).")
+    p.add_argument("--no-playout-cap", dest="full_search_prob",
+                   action="store_const", const=1.0,
+                   help="Search every ply fully (classic AlphaZero); "
+                        "equivalent to --full-search-prob 1.0.")
+    p.add_argument("--fpu-reduction", type=float, default=0.0,
+                   help="First-play-urgency penalty for unvisited children. "
+                        "0 treats them as drawn (AlphaZero); 0.2-0.3 makes "
+                        "the search commit sooner (native engine only).")
     p.add_argument("--resign-threshold", type=float, default=-0.90,
                    help="Resign once the mover's best root value stays at or "
                         "below this for two plies (raises games/hour by "
@@ -65,6 +96,15 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
                    help="Do not persist the replay buffer for resuming.")
     p.add_argument("--epochs", type=int, default=4,
                    help="Training epochs per iteration.")
+    p.add_argument("--sample-reuse", type=float, default=4.0,
+                   help="Expected number of times each position is sampled "
+                        "over its lifetime in the replay buffer; this sets the "
+                        "gradient-step count, which then scales with the data "
+                        "rather than with the buffer. 0 restores the old rule "
+                        "(one pass over the whole replay buffer per epoch).")
+    p.add_argument("--train-steps", type=int, default=0,
+                   help="Explicit gradient steps per iteration "
+                        "(0 = derive from --sample-reuse).")
     p.add_argument("--batch-size", type=int, default=1024,
                    help="Minibatch size for optimization.")
     p.add_argument("--lr", type=float, default=1e-3,
@@ -222,6 +262,13 @@ def _run_train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         games_in_flight=args.games_in_flight,
         pipeline_stages=args.pipeline_stages,
+        engine=args.engine,
+        pools=args.pools,
+        fast_simulations=args.fast_simulations,
+        full_search_prob=args.full_search_prob,
+        fpu_reduction=args.fpu_reduction,
+        sample_reuse=args.sample_reuse,
+        train_steps=args.train_steps,
         resign_threshold=args.resign_threshold if args.resign else None,
         resign_disable_fraction=args.resign_disable_fraction,
         save_buffer=args.save_buffer,
