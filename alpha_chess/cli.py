@@ -227,7 +227,15 @@ def _add_evaluate_parser(subparsers: argparse._SubParsersAction) -> None:
                    help="MCTS simulations per model move.")
     p.add_argument("--uci-elo", type=int, default=None,
                    help="If the opponent is a UCI engine that supports "
-                        "UCI_LimitStrength/UCI_Elo, cap it to this Elo.")
+                        "UCI_LimitStrength/UCI_Elo, cap it to this Elo. "
+                        "Engines enforce a floor (1320 on Stockfish 16) and a "
+                        "lower request is clamped with a warning; use "
+                        "--uci-skill for weaker opponents.")
+    p.add_argument("--uci-skill", type=int, default=None,
+                   help="If the opponent is a UCI engine with a Skill Level "
+                        "option, set it (0-20 on Stockfish, 0 being much "
+                        "weaker than any --uci-elo can reach). Mutually "
+                        "exclusive with --uci-elo.")
     p.add_argument("--max-moves", type=int, default=300,
                    help="Maximum plies before a game is scored a draw.")
     p.add_argument("--opening-plies", type=int, default=4,
@@ -367,6 +375,13 @@ def _run_evaluate(args: argparse.Namespace) -> None:
               file=sys.stderr)
         sys.exit(1)
 
+    # An engine limiting strength by Elo ignores its skill level, so refuse the
+    # combination rather than quietly honouring one of them.
+    if args.uci_elo is not None and args.uci_skill is not None:
+        print("Error: pass only one of --uci-elo and --uci-skill.",
+              file=sys.stderr)
+        sys.exit(1)
+
     result = evaluate_model(
         model_path=args.model,
         opponent_spec=args.opponent,
@@ -376,6 +391,7 @@ def _run_evaluate(args: argparse.Namespace) -> None:
         max_moves=args.max_moves,
         seed=args.seed,
         uci_elo=args.uci_elo,
+        uci_skill=args.uci_skill,
         opening_random_plies=args.opening_plies,
     )
 

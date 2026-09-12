@@ -513,7 +513,8 @@ on CUDA like the rest of the pipeline; at 200 simulations a game costs roughly
 | `--opponent` | `material` | `random` \| `material` \| `model:PATH` \| `uci:PATH`. |
 | `--games` | `40` | Number of games (colors alternate across games). |
 | `--simulations` | `200` | MCTS simulations per move for the evaluated model. |
-| `--uci-elo` | `None` | If the UCI opponent supports `UCI_LimitStrength`/`UCI_Elo`, cap it to this Elo. |
+| `--uci-elo` | `None` | If the UCI opponent supports `UCI_LimitStrength`/`UCI_Elo`, cap it to this Elo. Engines enforce a **floor** — 1320 on Stockfish 16 — and a lower request is clamped **with a warning**; use `--uci-skill` below that. |
+| `--uci-skill` | `None` | If the UCI opponent has a `Skill Level` option (0–20 on Stockfish), set it. Level 0 is far weaker than any `--uci-elo` can reach, which is what you want for a model that is not yet beating `material`. Mutually exclusive with `--uci-elo`. |
 | `--max-moves` | `300` | Move cap per game (games hitting the cap are scored as draws). |
 | `--opening-plies` | `4` | Random opening plies per game/color-swapped pair, so two deterministic players produce varied games (0 = always the start position). |
 | `--seed` | `None` | Seed for stochastic opponents, opening randomization, and color alternation. |
@@ -529,6 +530,26 @@ Evaluation vs material:
   Elo   : +191 (relative to opponent)
 Note: Elo is RELATIVE to this opponent, not an absolute rating; ...
 ```
+
+**Limiting engine strength.** Stockfish exposes two independent throttles and
+ignores its skill level whenever `UCI_LimitStrength` is on, so `evaluate` takes
+one or the other and errors if you pass both:
+
+```bash
+# Elo-limited: cannot go below the engine's floor (1320 on Stockfish 16)
+.venv/bin/python -m alpha_chess.cli evaluate --model models/best.pt \
+  --opponent uci:/usr/games/stockfish --uci-elo 1600 --games 40
+
+# Skill-limited: reaches genuinely weak play, for an early model
+.venv/bin/python -m alpha_chess.cli evaluate --model models/best.pt \
+  --opponent uci:/usr/games/stockfish --uci-skill 0 --games 40
+```
+
+The match header names the setting that was actually applied
+(`uci:/usr/games/stockfish @ Skill Level 0`), so a clamped request cannot be
+mistaken for the one you typed. Note also that a strength-limited Stockfish is
+not a human of that rating: it plays weaker moves but still does not hang
+pieces, so it tends to beat a human of the same nominal number.
 
 **Honesty about Elo.** The reported Elo difference is computed from the match
 score (`elo = -400·log10(1/score - 1)`, clamped at scores of 0 or 1) and is
@@ -1060,6 +1081,7 @@ tests/
   test_selfplay.py     search/terminal-detection correctness and replay-buffer tests
   test_mcts.py         interactive search: terminal handling, mate-in-one, caching
   test_native.py       perft + native-vs-Python parity for movegen, indices and planes
+  test_evaluate.py     Elo estimation and UCI strength limiting (clamping, skill level)
 requirements.txt
 README.md
 ```
@@ -1109,6 +1131,16 @@ and that playout-cap randomisation records exactly the full-search plies. The
 whole file skips itself when no compiler is available, which is exactly when
 training falls back to the Python engine.
 
+`test_evaluate.py` covers the reporting: that the Elo estimate is zero at an
+even score, is symmetric, and stays finite on a whitewash (tightening as the
+match lengthens); and that UCI strength limiting does what it says — a request
+below the engine's `UCI_Elo` floor is clamped **and warned about**, an in-range
+request is applied untouched and silently, `Skill Level` reaches below that
+floor, an out-of-range skill is clamped, the two throttles are refused
+together, and the match label names the setting actually applied rather than
+the one requested. The engine-backed tests skip when no UCI engine is
+installed.
+
 ---
 
 ## FAQ / troubleshooting
@@ -1156,6 +1188,12 @@ training falls back to the Python engine.
   package installs to `/usr/games/stockfish`, which is not on a non-root `PATH`,
   and Homebrew to `/opt/homebrew/bin/stockfish`. `--uci-elo` only takes effect if
   the engine advertises `UCI_LimitStrength`/`UCI_Elo`.
+- **`--uci-elo 600` gave me a crushing loss — is my model below 600?** Probably
+  not: engines refuse to go that low. Stockfish 16 advertises
+  `UCI_Elo min 1320`, so anything below that is clamped to 1320 (now with a
+  warning, and the match header names the applied setting). For an opponent
+  weaker than that floor use `--uci-skill 0`. Below `material`-baseline
+  strength, `random` and `material` are the informative anchors.
 - **GUI shows empty boxes instead of pieces.** The renderer auto-detects a font
   containing the Unicode chess glyphs (e.g. *Apple Symbols* on macOS,
   *DejaVu Sans* on Linux) and falls back to drawn lettered discs if none is
