@@ -1,4 +1,4 @@
-"""Tests for the GUI's undo/redo history (`gui.py`).
+"""Tests for the GUI's undo/redo history, last-move highlight and sounds.
 
 Redo has to mirror whatever Undo did: against the agent an Undo takes back a
 human/agent *pair*, so a Redo must restore the pair -- and must replay the
@@ -22,7 +22,15 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 pygame = pytest.importorskip("pygame")
 
-from alpha_chess.gui import MARGIN, SQUARE, _GuiApp  # noqa: E402
+from alpha_chess.gui import (  # noqa: E402
+    MARGIN,
+    SQUARE,
+    _AUDIO_HZ,
+    _GuiApp,
+    _click_samples,
+    _SoundBank,
+    _square_to_screen,
+)
 
 
 class _FirstMoveAgent:
@@ -224,3 +232,145 @@ def test_r_key_still_resets_the_editor_in_setup_mode(surface):
     app.handle_keydown(pygame.K_r)
     assert app.mode == "setup"
     assert app.setup_pieces != {}      # _reset_editor repopulated the board
+
+
+# --------------------------------------------------------------------------- #
+# Last-move highlight
+# --------------------------------------------------------------------------- #
+def _square_pixel(app, square):
+    """Colour of a square's top-left corner region, clear of any piece glyph."""
+    x, y = _square_to_screen(square, app.flipped)
+    return app.surface.get_at((x + 4, y + 4))[:3]
+
+
+def test_last_move_squares_are_tinted(surface):
+    app = _app(surface, advisor=True)
+    app.draw()
+    before_from = _square_pixel(app, chess.E2)
+    before_to = _square_pixel(app, chess.E4)
+
+    _play(app, ["e4"])
+    app.draw()
+    assert _square_pixel(app, chess.E2) != before_from
+    assert _square_pixel(app, chess.E4) != before_to
+
+
+def test_untouched_squares_are_not_tinted(surface):
+    app = _app(surface, advisor=True)
+    app.draw()
+    before = _square_pixel(app, chess.A5)
+    _play(app, ["e4"])
+    app.draw()
+    assert _square_pixel(app, chess.A5) == before
+
+
+def test_the_destination_is_tinted_more_strongly_than_the_origin(surface):
+    """The piece's new home should read louder than the square it left."""
+    app = _app(surface, advisor=True)
+    # e2, e4 and the e6 reference are all light squares, so the only
+    # difference between them is the tint.
+    _play(app, ["e4"])
+    app.draw()
+    plain = _square_pixel(app, chess.E6)      # same colour, untouched
+    origin = _square_pixel(app, chess.E2)
+    dest = _square_pixel(app, chess.E4)
+    assert 0 < _dist(origin, plain) < _dist(dest, plain)
+
+
+def _dist(a, b):
+    return sum(abs(int(x) - int(y)) for x, y in zip(a, b))
+
+
+def test_highlight_follows_undo_and_redo(surface):
+    """It is read off the move stack, so it must never go stale."""
+    app = _app(surface, advisor=True)
+    _play(app, ["e4", "e5"])
+    app.draw()
+    tinted_e5 = _square_pixel(app, chess.E5)
+
+    app._undo()
+    app.draw()
+    assert _square_pixel(app, chess.E5) != tinted_e5   # no longer the last move
+
+    app._redo()
+    app.draw()
+    assert _square_pixel(app, chess.E5) == tinted_e5
+
+
+def test_no_highlight_on_a_fresh_board(surface):
+    app = _app(surface, advisor=True)
+    app.draw()
+    baseline = {sq: _square_pixel(app, sq) for sq in chess.SQUARES}
+    app._new_game()
+    app.draw()
+    assert {sq: _square_pixel(app, sq) for sq in chess.SQUARES} == baseline
+
+
+# --------------------------------------------------------------------------- #
+# Move sounds
+# --------------------------------------------------------------------------- #
+def test_click_samples_are_int16_stereo_and_decay_to_silence():
+    """A click that does not decay ends in an audible pop."""
+    import numpy
+
+    samples = _click_samples(
+        numpy, freq=880.0, ms=55, decay=70.0, noise=0.45, gain=0.35)
+    assert samples.dtype == numpy.int16
+    assert samples.shape == (int(_AUDIO_HZ * 0.055), 2)
+    peak = abs(samples).max()
+    tail = abs(samples[-int(_AUDIO_HZ * 0.005):]).max()
+    assert peak > 1000                      # actually audible
+    assert tail < peak * 0.1                # faded out by the end
+
+
+def test_click_samples_are_deterministic():
+    """The same move must not sound different each time it is played."""
+    import numpy
+
+    kw = dict(freq=880.0, ms=20, decay=70.0, noise=0.5, gain=0.3)
+    assert (_click_samples(numpy, **kw) == _click_samples(numpy, **kw)).all()
+
+
+def test_capture_and_quiet_moves_get_different_clicks(surface):
+    bank = _SoundBank(pygame)
+    board = chess.Board()
+    board.push_san("e4")
+    board.push_san("d5")
+    assert bank.for_move(board, chess.Move.from_uci("e4d5")) == "capture"
+    assert bank.for_move(board, chess.Move.from_uci("g1f3")) == "move"
+
+
+def test_headless_app_makes_no_sound_bank(surface):
+    """A test run or offscreen render must never touch an audio device."""
+    app = _app(surface, advisor=True)
+    assert app.sounds is None
+    _play(app, ["e4"])
+    app._undo()
+    app._redo()                  # goes through _push_move; must not raise
+
+
+def test_mute_toggle_reports_when_sound_is_unavailable(surface):
+    app = _app(surface, advisor=True)     # headless -> no sound bank
+    app.handle_keydown(pygame.K_m)
+    assert app.status_msg == "Sound unavailable"
+
+
+def test_mute_toggle_flips_and_reports(surface):
+    app = _app(surface, advisor=True)
+    app.sounds = _SoundBank(pygame)
+    if not app.sounds.enabled:
+        pytest.skip("no audio device available")
+    app.handle_keydown(pygame.K_m)
+    assert app.sounds.muted is True
+    assert app.status_msg == "Sound off"
+    app.handle_keydown(pygame.K_m)
+    assert app.sounds.muted is False
+    assert app.status_msg == "Sound on"
+
+
+def test_muted_bank_plays_nothing(surface):
+    bank = _SoundBank(pygame)
+    bank.muted = True
+    bank.play("move")            # must be a silent no-op, not an error
+    bank.enabled = False
+    bank.play("capture")

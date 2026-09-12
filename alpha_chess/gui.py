@@ -2,7 +2,8 @@
 
 Modes:
 
-* **play**  -- click to move against the agent (H=hint, U=undo, R=redo, ...).
+* **play**  -- click to move against the agent (H=hint, U=undo, R=redo,
+  M=mute, ...).
 * **advisor** -- a variant of play mode (``mode == "play"`` with
   ``advisor=True``): the user makes every move for BOTH colours -- mirroring a
   game played in a separate application -- and asks the engine for the best
@@ -49,6 +50,7 @@ COORD_COLOR = (206, 197, 184)      # coordinate labels drawn in the margin
 SEL_COLOR = (246, 232, 96)         # selected square highlight
 DEST_COLOR = (90, 150, 70)         # legal-destination marker
 HINT_COLOR = (74, 144, 226)        # hint / analysis from-to highlight
+LASTMOVE_COLOR = (255, 205, 80)    # from/to of the move just played
 PANEL_BG = (40, 40, 45)
 PANEL_FG = (230, 230, 230)
 PANEL_DIM = (170, 170, 175)
@@ -86,6 +88,93 @@ GLYPH_FONTS = [
 # surface is the "tofu"/missing-glyph box. Comparing a real glyph's pixels to
 # this tells us whether the font actually contains the glyph.
 _MISSING_GLYPH = "\U000F0000"
+
+
+# Sample rate for the synthesised move sounds.
+_AUDIO_HZ = 44100
+
+
+def _click_samples(numpy, freq: float, ms: int, decay: float,
+                   noise: float, gain: float):
+    """Synthesise a short wooden click as an int16 stereo array.
+
+    A piece landing on a board is a percussive transient, not a tone: a burst
+    of noise for the contact plus a fast-decaying low sine for the body of the
+    board. Generating it here keeps the package free of binary audio assets.
+    """
+    n = int(_AUDIO_HZ * ms / 1000)
+    t = numpy.arange(n, dtype=numpy.float64) / _AUDIO_HZ
+    envelope = numpy.exp(-decay * t)
+    # Deterministic noise, so the click sounds the same every time.
+    rng = numpy.random.default_rng(0)
+    body = numpy.sin(2.0 * numpy.pi * freq * t)
+    wave = (1.0 - noise) * body + noise * rng.uniform(-1.0, 1.0, n)
+    wave *= envelope * gain
+    # A couple of ms of fade-in stops the attack from clipping into a pop.
+    attack = min(n, int(_AUDIO_HZ * 0.002))
+    if attack:
+        wave[:attack] *= numpy.linspace(0.0, 1.0, attack)
+    mono = numpy.clip(wave, -1.0, 1.0) * 32767.0
+    return numpy.ascontiguousarray(
+        numpy.column_stack([mono, mono]).astype(numpy.int16))
+
+
+class _SoundBank:
+    """Move/capture click sounds, degrading to silence when unavailable.
+
+    Audio is entirely optional: a machine with no sound device (or a headless
+    test run) must still play chess, so every step is guarded and any failure
+    leaves :attr:`enabled` False rather than raising.
+    """
+
+    def __init__(self, pygame) -> None:
+        self.pygame = pygame
+        self.enabled = False
+        self.muted = False
+        self._sounds = {}
+        try:
+            import numpy
+
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=_AUDIO_HZ, size=-16, channels=2)
+            if not pygame.mixer.get_init():
+                return
+            make = pygame.sndarray.make_sound
+            self._sounds = {
+                # A crisp tap for a quiet move...
+                "move": make(_click_samples(
+                    numpy, freq=880.0, ms=55, decay=70.0,
+                    noise=0.45, gain=0.35)),
+                # ...and a lower, fuller knock when wood hits wood.
+                "capture": make(_click_samples(
+                    numpy, freq=520.0, ms=85, decay=45.0,
+                    noise=0.6, gain=0.5)),
+            }
+            self.enabled = True
+        except Exception:  # pragma: no cover - platform/audio specific
+            self.enabled = False
+            self._sounds = {}
+
+    def play(self, name: str) -> None:
+        """Play a named click; a no-op when muted or unavailable."""
+        if not self.enabled or self.muted:
+            return
+        sound = self._sounds.get(name)
+        if sound is None:
+            return
+        try:
+            sound.play()
+        except Exception:  # pragma: no cover - platform/audio specific
+            pass
+
+    def for_move(self, board, move) -> str:
+        """Pick the click for ``move``, which must not yet be pushed."""
+        try:
+            if board.is_capture(move):
+                return "capture"
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return "move"
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +465,9 @@ class _GuiApp:
         # Plies taken back by Undo, newest first, so Redo can replay them.
         # Cleared whenever a move is played onto a different line.
         self.redo_stack: List[chess.Move] = []
+        # Move sounds. Skipped entirely without a display, so headless
+        # rendering and tests never touch an audio device.
+        self.sounds = _SoundBank(pygame) if has_display else None
 
         # ----- setup-mode state -----
         self.mode = "play"
@@ -573,6 +665,16 @@ class _GuiApp:
         self.hint_info = []
         self._refresh_status()
 
+    def _push_move(self, move: chess.Move) -> None:
+        """Play ``move`` on the board, with its sound.
+
+        Every piece movement goes through here -- human, agent and redo -- so
+        the board and the audio cannot drift apart.
+        """
+        if self.sounds is not None:
+            self.sounds.play(self.sounds.for_move(self.board, move))
+        self.board.push(move)
+
     def _redo(self) -> None:
         """Replay plies taken back by Undo, in the order they were played.
 
@@ -595,11 +697,18 @@ class _GuiApp:
                 self.status_msg = "Nothing to redo"
                 break
             self.redo_stack.pop()
-            self.board.push(move)
+            self._push_move(move)
         self._clear_selection()
         self.hint_squares = None
         self.hint_info = []
         self._refresh_status()
+
+    def _toggle_mute(self) -> None:
+        if self.sounds is None or not self.sounds.enabled:
+            self.status_msg = "Sound unavailable"
+            return
+        self.sounds.muted = not self.sounds.muted
+        self.status_msg = "Sound off" if self.sounds.muted else "Sound on"
 
     def _hint(self) -> None:
         if self.agent is None:
@@ -647,7 +756,7 @@ class _GuiApp:
                     self.redo_stack.clear()
                 else:
                     self.redo_stack.pop()
-                self.board.push(move)
+                self._push_move(move)
                 self._clear_selection()
                 self.hint_squares = None
                 self.hint_info = []
@@ -674,7 +783,7 @@ class _GuiApp:
                     self.redo_stack.pop()
                 else:
                     self.redo_stack.clear()
-                self.board.push(move)
+                self._push_move(move)
         except Exception as exc:  # pragma: no cover - defensive
             self.status_msg = "Agent error: %s" % exc
         self._refresh_status()
@@ -798,6 +907,8 @@ class _GuiApp:
                 self._undo()
             elif key == K.K_r:
                 self._redo()
+            elif key == K.K_m:
+                self._toggle_mute()
             elif key in (K.K_h, K.K_SPACE, K.K_a):
                 self._hint()
         else:  # setup mode
@@ -1113,6 +1224,18 @@ def _draw(
     # --- board backdrop + squares ---
     _draw_board_backdrop(pygame, screen, flipped)
 
+    # --- last move played (translucent, under every other highlight) ---
+    # Read straight off the move stack rather than tracked separately, so undo,
+    # redo and new-game need no bookkeeping to keep it honest. Whenever it is
+    # your turn, the move shown is your opponent's. The destination is tinted
+    # more strongly than the origin: that is where the piece now stands.
+    last = board.move_stack[-1] if board.move_stack else None
+    if last is not None:
+        _fill_square(pygame, screen, last.from_square, flipped,
+                     (*LASTMOVE_COLOR, 45))
+        _fill_square(pygame, screen, last.to_square, flipped,
+                     (*LASTMOVE_COLOR, 75))
+
     # --- selected square highlight (translucent) ---
     if selected is not None:
         _fill_square(pygame, screen, selected, flipped, (*SEL_COLOR, 130))
@@ -1199,6 +1322,7 @@ def _draw(
             "H / SPACE - best move",
             "click - move either side",
             "U / R - undo / redo",
+            "M - mute sound",
             "E - set up position",
             "F - flip",
             "N - new game",
@@ -1208,6 +1332,7 @@ def _draw(
         help_lines = [
             "H - hint",
             "U / R - undo / redo",
+            "M - mute sound",
             "N - new game",
             "F - flip board",
             "E - setup / editor",

@@ -598,8 +598,16 @@ falls back to **human vs human** with the agent and hints disabled.
   and is instant. Playing a different move instead discards the redo history.
 - **N** — new game.
 - **F** — flip the board.
+- **M** — mute / unmute the move sounds.
 - **E** — enter the **board editor** (see below).
 - **ESC / Q** — quit.
+
+The square a piece came from and the square it landed on are tinted amber, the
+destination more strongly — so whenever it is your turn, the highlight shows
+you the move your opponent just made. Each move also plays a short wooden
+click, with a lower, fuller knock for a capture. The clicks are synthesised at
+startup (no audio files ship with the package) and are silently skipped on a
+machine with no sound device; **M** mutes them.
 
 The side panel shows whose turn it is, check/checkmate/stalemate/draw status, a
 "thinking…" indicator while the agent searches, and the latest evaluation.
@@ -639,7 +647,12 @@ works for making moves; asking for a suggestion just shows
 - **E** — open the **board editor** (below) to set up a mid-game position when
   you join a game already in progress.
 - **F** — flip the board.  **N** — new game (standard start position).
+- **M** — mute / unmute the move sounds.
 - **Q / ESC** — quit.
+
+The last move played is tinted amber on both its squares (the destination more
+strongly), and every move plays a short click — useful here for confirming
+that a move you mirrored from the other application actually registered.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -1087,7 +1100,7 @@ tests/
   test_mcts.py         interactive search: terminal handling, mate-in-one, caching
   test_native.py       perft + native-vs-Python parity for movegen, indices and planes
   test_evaluate.py     Elo estimation and UCI strength limiting (clamping, skill level)
-  test_gui.py          GUI undo/redo history, headless (no window opened)
+  test_gui.py          GUI undo/redo, last-move highlight, move sounds (headless)
 requirements.txt
 README.md
 ```
@@ -1157,6 +1170,16 @@ different move played by hand, a new game, or a position adopted from the
 editor. It also checks `R` is redo in play mode while still resetting the
 editor in setup mode.
 
+It also covers the last-move highlight and the move sounds: that both squares
+of the last move are tinted and untouched squares are not, that the
+destination is tinted more strongly than the origin, that the highlight
+follows undo/redo (it is read off the move stack, so it cannot go stale) and
+is absent on a fresh board; and that the synthesised clicks are int16 stereo,
+decay to silence rather than ending in a pop, are identical every time, and
+that captures and quiet moves get different ones. A headless app builds no
+sound bank at all, so neither the tests nor an offscreen render touch an audio
+device.
+
 ---
 
 ## FAQ / troubleshooting
@@ -1210,6 +1233,12 @@ editor in setup mode.
   warning, and the match header names the applied setting). For an opponent
   weaker than that floor use `--uci-skill 0`. Below `material`-baseline
   strength, `random` and `material` are the informative anchors.
+- **I hear no move sounds.** They need a working audio device; when the mixer
+  cannot open one the GUI stays silent rather than failing, and the rest of the
+  window works normally. Check **M** has not muted them (the panel lists it),
+  and on WSL that WSLg's PulseAudio server is up (`pactl info`). No audio files
+  are involved — the clicks are synthesised at startup — so there is nothing
+  missing to reinstall.
 - **GUI shows empty boxes instead of pieces.** The renderer auto-detects a font
   containing the Unicode chess glyphs (e.g. *Apple Symbols* on macOS,
   *DejaVu Sans* on Linux) and falls back to drawn lettered discs if none is
