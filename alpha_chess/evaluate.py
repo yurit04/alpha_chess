@@ -18,6 +18,7 @@ engine configured to a known strength.
 import math
 import os
 import random
+import sys
 from typing import Callable, Dict, List, Optional, Union
 
 import chess
@@ -123,15 +124,26 @@ class UCIOpponent:
     """Wraps an external UCI engine as a move-chooser.
 
     The engine process is opened lazily via ``chess.engine.SimpleEngine`` and
-    must be closed with :meth:`close`. When ``uci_elo`` is provided and the
-    engine advertises ``UCI_LimitStrength``/``UCI_Elo``, the engine is
-    configured to that strength.
+    must be closed with :meth:`close`. Strength can be limited two ways, and
+    engines that support both treat them as exclusive (Stockfish ignores its
+    ``Skill Level`` while ``UCI_LimitStrength`` is on), so pass only one:
+
+    * ``uci_elo`` sets ``UCI_LimitStrength``/``UCI_Elo``. Engines advertise a
+      floor here -- Stockfish 16's is 1320 -- so this cannot reach beginner
+      strength.
+    * ``skill_level`` sets the engine's ``Skill Level`` option, which does go
+      down to genuinely weak play (0 on Stockfish).
+
+    Whatever is actually applied is recorded in :attr:`strength_note`, and a
+    request outside the engine's advertised range is clamped with a warning
+    rather than silently changed.
     """
 
     def __init__(
         self,
         engine_path: str,
         uci_elo: Optional[int] = None,
+        skill_level: Optional[int] = None,
         time_limit: float = 0.1,
     ) -> None:
         # Import guarded here so the rest of the module works without an engine.
@@ -140,30 +152,88 @@ class UCIOpponent:
         if not os.path.exists(engine_path):
             raise FileNotFoundError(f"UCI engine not found: {engine_path}")
 
+        if uci_elo is not None and skill_level is not None:
+            raise ValueError(
+                "Pass only one of uci_elo and skill_level: an engine limiting "
+                "strength by Elo ignores its skill level."
+            )
+
         self._engine = chess.engine.SimpleEngine.popen_uci(engine_path)
         self._limit = chess.engine.Limit(time=time_limit)
+        # What the engine was actually configured to, for the match label.
+        self.strength_note: Optional[str] = None
 
         if uci_elo is not None:
-            try:
-                options = self._engine.options
-                config = {}
-                if "UCI_LimitStrength" in options:
-                    config["UCI_LimitStrength"] = True
-                if "UCI_Elo" in options:
-                    opt = options["UCI_Elo"]
-                    lo = getattr(opt, "min", None)
-                    hi = getattr(opt, "max", None)
-                    elo = uci_elo
-                    if lo is not None:
-                        elo = max(elo, int(lo))
-                    if hi is not None:
-                        elo = min(elo, int(hi))
-                    config["UCI_Elo"] = elo
-                if config:
-                    self._engine.configure(config)
-            except Exception:
-                # Strength limiting is best-effort; ignore unsupported engines.
-                pass
+            self._limit_by_elo(int(uci_elo))
+        elif skill_level is not None:
+            self._limit_by_skill(int(skill_level))
+
+    def _clamp_to_option(self, name: str, requested: int) -> int:
+        """Clamp ``requested`` into the engine's advertised range for ``name``.
+
+        Engines silently accept (or reject) out-of-range values, which is how a
+        request for a 600-Elo opponent turns into a 1320-Elo one with nothing
+        said, so say it.
+        """
+        opt = self._engine.options[name]
+        lo = getattr(opt, "min", None)
+        hi = getattr(opt, "max", None)
+        value = requested
+        if lo is not None:
+            value = max(value, int(lo))
+        if hi is not None:
+            value = min(value, int(hi))
+        if value != requested:
+            print(
+                "Warning: {n} {r} is outside this engine's supported range "
+                "({lo}-{hi}); using {v} instead.".format(
+                    n=name, r=requested, lo=lo, hi=hi, v=value),
+                file=sys.stderr,
+            )
+        return value
+
+    def _limit_by_elo(self, uci_elo: int) -> None:
+        """Configure ``UCI_LimitStrength``/``UCI_Elo``, best effort."""
+        options = self._engine.options
+        if "UCI_LimitStrength" not in options or "UCI_Elo" not in options:
+            print(
+                "Warning: this engine does not advertise UCI_LimitStrength/"
+                "UCI_Elo; it plays at FULL strength and --uci-elo is ignored.",
+                file=sys.stderr,
+            )
+            return
+        elo = self._clamp_to_option("UCI_Elo", uci_elo)
+        try:
+            self._engine.configure(
+                {"UCI_LimitStrength": True, "UCI_Elo": elo})
+        except Exception as exc:  # pragma: no cover - engine-specific
+            print("Warning: could not set UCI_Elo: {}".format(exc),
+                  file=sys.stderr)
+            return
+        self.strength_note = "UCI_Elo {}".format(elo)
+
+    def _limit_by_skill(self, skill_level: int) -> None:
+        """Configure the engine's ``Skill Level`` option, best effort."""
+        options = self._engine.options
+        if "Skill Level" not in options:
+            print(
+                "Warning: this engine does not advertise a Skill Level option; "
+                "it plays at FULL strength and --uci-skill is ignored.",
+                file=sys.stderr,
+            )
+            return
+        skill = self._clamp_to_option("Skill Level", skill_level)
+        try:
+            # UCI_LimitStrength would override Skill Level where both exist.
+            config = {"Skill Level": skill}
+            if "UCI_LimitStrength" in options:
+                config["UCI_LimitStrength"] = False
+            self._engine.configure(config)
+        except Exception as exc:  # pragma: no cover - engine-specific
+            print("Warning: could not set Skill Level: {}".format(exc),
+                  file=sys.stderr)
+            return
+        self.strength_note = "Skill Level {}".format(skill)
 
     def choose_move(self, board: chess.Board) -> chess.Move:
         result = self._engine.play(board, self._limit)
@@ -338,7 +408,12 @@ def estimate_elo_diff(score: float, games: int) -> float:
 # --------------------------------------------------------------------------- #
 # High-level model evaluation
 # --------------------------------------------------------------------------- #
-def _make_opponent(opponent_spec: str, seed: Optional[int], uci_elo: Optional[int]):
+def _make_opponent(
+    opponent_spec: str,
+    seed: Optional[int],
+    uci_elo: Optional[int],
+    uci_skill: Optional[int] = None,
+):
     """Build an opponent chooser from a spec string.
 
     Returns ``(chooser, label, closer)`` where ``closer`` is a zero-arg callable
@@ -364,8 +439,14 @@ def _make_opponent(opponent_spec: str, seed: Optional[int], uci_elo: Optional[in
 
     if spec.startswith("uci:"):
         path = spec[len("uci:"):]
-        opp = UCIOpponent(path, uci_elo=uci_elo)
-        return opp, f"uci:{path}", opp.close
+        opp = UCIOpponent(path, uci_elo=uci_elo, skill_level=uci_skill)
+        # Name the strength that was actually applied, not the one requested:
+        # engines clamp, and a label reading "uci:stockfish" alone invites
+        # reading the result as a rating it does not support.
+        label = f"uci:{path}"
+        if opp.strength_note:
+            label += f" @ {opp.strength_note}"
+        return opp, label, opp.close
 
     raise ValueError(
         f"Unknown opponent spec: {opponent_spec!r}. "
@@ -382,6 +463,7 @@ def evaluate_model(
     max_moves: int = 300,
     seed: Optional[int] = None,
     uci_elo: Optional[int] = None,
+    uci_skill: Optional[int] = None,
     opening_random_plies: int = 4,
 ) -> Dict[str, object]:
     """Evaluate a trained model against a chosen opponent.
@@ -389,7 +471,8 @@ def evaluate_model(
     Loads the model at ``model_path`` as an :class:`AlphaChessAgent` and plays it
     (player A) against ``opponent_spec``: one of ``"random"``, ``"material"``,
     ``"model:PATH"`` (another AlphaChess checkpoint), or ``"uci:PATH"`` (an
-    external UCI engine; ``uci_elo`` configures its strength when supported).
+    external UCI engine; ``uci_elo`` or ``uci_skill`` configures its strength
+    when supported).
 
     Args:
         model_path: Path to the AlphaChess checkpoint to evaluate.
@@ -399,7 +482,10 @@ def evaluate_model(
         device: Torch device (or None to auto-select).
         max_moves: Move cap per game (games hitting the cap are scored as draws).
         seed: Seed for stochastic opponents / color alternation.
-        uci_elo: Optional target Elo for a UCI opponent.
+        uci_elo: Optional target Elo for a UCI opponent. Engines enforce a
+            floor (1320 on Stockfish 16); below it, use ``uci_skill``.
+        uci_skill: Optional ``Skill Level`` for a UCI opponent, which reaches
+            much weaker play than ``uci_elo`` can. Mutually exclusive with it.
 
     Returns:
         A dict with ``score``, ``wins``, ``draws``, ``losses``, ``elo_diff`` and
@@ -419,7 +505,8 @@ def evaluate_model(
     agent = AlphaChessAgent(model_path, device=device, simulations=simulations)
     model_chooser = _AgentChooser(agent)
 
-    opponent, label, closer = _make_opponent(opponent_spec, seed=seed, uci_elo=uci_elo)
+    opponent, label, closer = _make_opponent(
+        opponent_spec, seed=seed, uci_elo=uci_elo, uci_skill=uci_skill)
     try:
         result = play_match(
             model_chooser,
