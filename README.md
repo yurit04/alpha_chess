@@ -23,6 +23,12 @@ CUDA-only fast paths (fp16 autocast, GradScaler, cudnn.benchmark, channels-last,
 pinned memory) are all guarded and simply fall back to fp32, and the native core
 degrades to the Python engine when no compiler is available.
 
+> **Deep dive:** [`docs/alpha_chess.pdf`](docs/alpha_chess.pdf) is an 18-page
+> technical write-up of the method as implemented here — encodings, network,
+> PUCT search, the self-play pipeline, the training objective, and how strength
+> is measured. The [How it works](#how-it-works) section below is the shorter
+> tour.
+
 ---
 
 ## Table of contents
@@ -1095,6 +1101,9 @@ alpha_chess/
   agent.py             high-level agent: play_move / suggest_move
   gui.py               pygame GUI (play + advisor board + board editor)
   cli.py               train / evaluate / suggest / play / analyze command line
+docs/
+  alpha_chess.typ      Typst source for the technical write-up
+  alpha_chess.pdf      built PDF (committed; see docs/README.md to rebuild)
 tests/
   test_encoding.py     round-trip, mirror-invariance and packing tests for the encoding
   test_selfplay.py     search/terminal-detection correctness and replay-buffer tests
