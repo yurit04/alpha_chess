@@ -52,8 +52,9 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--num-workers", type=int, default=None,
                    help="Self-play search processes for the PYTHON engine. "
                         "Its tree search is GIL-bound, so this is that "
-                        "engine's main throughput lever (default: CPU count "
-                        "- 2). Unused by the native engine.")
+                        "engine's main throughput lever (default: three "
+                        "quarters of the CPU count, capped at 24). Unused by "
+                        "the native engine.")
     p.add_argument("--games-in-flight", type=int, default=1024,
                    help="Concurrent games searched per pool (native) or per "
                         "worker (Python). The network batch is that many "

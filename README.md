@@ -178,17 +178,20 @@ iterations). Restores model + optimizer + iteration + RNG and continues:
   --opponent model:models/checkpoint_020.pt --games 60 --simulations 400
 ```
 
-**4 — Anchor to a REAL Elo** with a calibrated engine (install Stockfish; adjust
-the path). Bracket the level by trying a few `--uci-elo` caps — the target is a
-~50% score against ~1500–2000:
+**4 — Anchor to a REAL Elo** with a calibrated engine. Install Stockfish and
+pass its path — `apt install stockfish` puts it at `/usr/games/stockfish`
+(which is not on a non-root `PATH`), Homebrew at `/opt/homebrew/bin/stockfish`;
+`which stockfish || ls /usr/games/stockfish` finds it. Bracket the level by
+trying a few `--uci-elo` caps — the target is a ~50% score against
+~1500–2000:
 
 ```bash
 .venv/bin/python -m alpha_chess.cli evaluate --model models/best.pt \
-  --opponent uci:/opt/homebrew/bin/stockfish --uci-elo 1500 \
+  --opponent uci:/usr/games/stockfish --uci-elo 1500 \
   --games 60 --simulations 800
 
 .venv/bin/python -m alpha_chess.cli evaluate --model models/best.pt \
-  --opponent uci:/opt/homebrew/bin/stockfish --uci-elo 2000 \
+  --opponent uci:/usr/games/stockfish --uci-elo 2000 \
   --games 60 --simulations 800
 ```
 
@@ -261,7 +264,7 @@ architecture from each checkpoint's stored config, so any size just works.
 | `--full-search-prob` | `0.25` | Probability a ply gets the full `--simulations` budget, root Dirichlet noise, and a recorded training target. See [playout-cap randomisation](#playout-cap-randomisation). Native engine only. |
 | `--no-playout-cap` | off | Shorthand for `--full-search-prob 1.0`: search every ply fully (classic AlphaZero). |
 | `--fpu-reduction` | `0.0` | First-play-urgency penalty for unvisited children. `0` treats them as drawn (AlphaZero); `0.2`-`0.3` makes the search commit to promising moves sooner. Native engine only. |
-| `--num-workers` | 3/4 of CPU count | Search **processes** for the *Python* engine only; that search is GIL-bound, so it is that engine's main throughput lever. The native core ignores it. |
+| `--num-workers` | ¾ of CPU count, capped at 24 | Search **processes** for the *Python* engine only; that search is GIL-bound, so it is that engine's main throughput lever. The native core ignores it. |
 | `--pipeline-stages` | `4` | Sub-pools per worker (Python engine only). |
 | `--resign-threshold` | `-0.90` | Resign once the mover's best root value stays at or below this for two plies. `--no-resign` plays every game out. |
 | `--resign-disable-fraction` | `0.10` | Fraction of games played out with resignation suppressed, to measure the resign false-positive rate (printed each iteration). |
@@ -389,9 +392,11 @@ output directory. Point `--resume` at the file or its directory:
   --iterations 160 --channels 128 --blocks 10 --games-in-flight 1024
 ```
 
-This restores the model, optimizer, iteration counter, and RNG states and
-**continues from the next iteration**. If you instead point `--resume` at a
-plain model checkpoint (e.g. `checkpoint_012.pt`), it loads the **weights only**
+This restores the model, optimizer, iteration counter, RNG states **and the
+replay buffer** (`replay_buffer.npz`, written next to `train_state.pt` unless
+`--no-save-buffer`) and **continues from the next iteration**. If you instead
+point `--resume` at a plain model checkpoint (e.g. `checkpoint_012.pt`), it
+loads the **weights only**
 and starts a fresh optimizer — useful for fine-tuning. Missing optimizer state
 never crashes the run.
 
@@ -498,7 +503,7 @@ on CUDA like the rest of the pipeline; at 200 simulations a game costs roughly
 
 # vs an external UCI engine (e.g. Stockfish), capped to ~1600 Elo if supported
 .venv/bin/python -m alpha_chess.cli evaluate \
-  --model models/best.pt --opponent uci:/usr/local/bin/stockfish \
+  --model models/best.pt --opponent uci:/usr/games/stockfish \
   --uci-elo 1600 --games 40 --simulations 400
 ```
 
@@ -1125,11 +1130,15 @@ training falls back to the Python engine.
   model — the value/policy are near-untrained. Train longer with more
   `--iterations`, `--games-per-iter`, and `--simulations`; measure progress with
   `evaluate`. Reaching 1500–2000 from scratch is a run of days on a 3090.
-- **How do I speed up self-play?** Raise `--num-workers` toward your core count
-  — self-play is **CPU-bound** in python-chess, so cores matter more than the
-  GPU. Then raise `--games-in-flight` to widen the batched forward pass, and
-  keep `--amp` on (default). Watch the per-iteration log: if "GPU busy" is low,
-  add workers; if mean batch is small, raise `--games-in-flight`.
+- **How do I speed up self-play?** With the native core the GPU is the
+  bottleneck, so the lever is batch width: raise `--games-in-flight` (it *is*
+  the network's batch size) and keep `--amp` on (default). `--pools` only needs
+  to be 2–3 — enough to overlap one pool's tree search with the next pool's
+  forward pass. Watch the per-iteration log: if mean batch is well under
+  `--games-in-flight`, raise `--games-per-iter` so fewer iterations are spent
+  in the drain tail; if "GPU busy" is low, widen the batch or shrink the net
+  (`--channels` / `--blocks`). `--num-workers` is a *Python*-engine knob and
+  does nothing here — see the two bullets above.
 - **Is mixed precision automatic?** Yes. On CUDA, `--device auto` selects the GPU
   and fp16 AMP + cudnn.benchmark + channels-last activate automatically. On
   CPU/MPS everything runs fp32. Disable AMP with `--no-amp`.
@@ -1141,8 +1150,12 @@ training falls back to the Python engine.
   not an absolute rating. Anchor a comparable number with a calibrated UCI engine
   (`uci:PATH` + `--uci-elo`) or online play.
 - **UCI opponent errors.** The UCI path is optional and imported lazily; you need
-  a real engine binary (e.g. Stockfish) at the path you pass. `--uci-elo` only
-  takes effect if the engine advertises `UCI_LimitStrength`/`UCI_Elo`.
+  a real engine binary (e.g. Stockfish) at the path you pass — `FileNotFoundError:
+  UCI engine not found` means that path is wrong, not that the engine is missing.
+  Find it with `which stockfish || ls /usr/games/stockfish`: the Debian/Ubuntu
+  package installs to `/usr/games/stockfish`, which is not on a non-root `PATH`,
+  and Homebrew to `/opt/homebrew/bin/stockfish`. `--uci-elo` only takes effect if
+  the engine advertises `UCI_LimitStrength`/`UCI_Elo`.
 - **GUI shows empty boxes instead of pieces.** The renderer auto-detects a font
   containing the Unicode chess glyphs (e.g. *Apple Symbols* on macOS,
   *DejaVu Sans* on Linux) and falls back to drawn lettered discs if none is
