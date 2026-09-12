@@ -602,9 +602,10 @@ falls back to **human vs human** with the agent and hints disabled.
 - **E** — enter the **board editor** (see below).
 - **ESC / Q** — quit.
 
-The square a piece came from and the square it landed on are tinted amber, the
-destination more strongly — so whenever it is your turn, the highlight shows
-you the move your opponent just made. Each move also plays a short wooden
+The piece that moved last is **boxed in green** on the square it now occupies
+— so whenever it is your turn, the box is around your opponent's piece. It is
+a hard-edged border rather than a tint, which stays legible on light and dark
+squares alike. Each move also plays a short wooden
 click, with a lower, fuller knock for a capture. The clicks are synthesised at
 startup (no audio files ship with the package) and are silently skipped on a
 machine with no sound device; **M** mutes them.
@@ -650,9 +651,9 @@ works for making moves; asking for a suggestion just shows
 - **M** — mute / unmute the move sounds.
 - **Q / ESC** — quit.
 
-The last move played is tinted amber on both its squares (the destination more
-strongly), and every move plays a short click — useful here for confirming
-that a move you mirrored from the other application actually registered.
+The piece that moved last is boxed in green, and every move plays a short
+click — useful here for confirming that a move you mirrored from the other
+application actually registered.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -1100,7 +1101,7 @@ tests/
   test_mcts.py         interactive search: terminal handling, mate-in-one, caching
   test_native.py       perft + native-vs-Python parity for movegen, indices and planes
   test_evaluate.py     Elo estimation and UCI strength limiting (clamping, skill level)
-  test_gui.py          GUI undo/redo, last-move highlight, move sounds (headless)
+  test_gui.py          GUI undo/redo, last-move box, move sounds (headless)
 requirements.txt
 README.md
 ```
@@ -1170,11 +1171,12 @@ different move played by hand, a new game, or a position adopted from the
 editor. It also checks `R` is redo in play mode while still resetting the
 editor in setup mode.
 
-It also covers the last-move highlight and the move sounds: that both squares
-of the last move are tinted and untouched squares are not, that the
-destination is tinted more strongly than the origin, that the highlight
-follows undo/redo (it is read off the move stack, so it cannot go stale) and
-is absent on a fresh board; and that the synthesised clicks are int16 stereo,
+It also covers the last-move box and the move sounds: that the destination
+square is boxed and the origin and untouched squares are not, that it is a
+border rather than a fill (the square colour still shows through), that it is
+legible on both square colours, that it follows undo/redo (it is read off the
+move stack, so it cannot go stale) and is absent on a fresh board; and that
+the synthesised clicks are int16 stereo,
 decay to silence rather than ending in a pop, are identical every time, and
 that captures and quiet moves get different ones. A headless app builds no
 sound bank at all, so neither the tests nor an offscreen render touch an audio

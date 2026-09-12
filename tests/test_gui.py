@@ -1,4 +1,4 @@
-"""Tests for the GUI's undo/redo history, last-move highlight and sounds.
+"""Tests for the GUI's undo/redo history, last-move box and move sounds.
 
 Redo has to mirror whatever Undo did: against the agent an Undo takes back a
 human/agent *pair*, so a Redo must restore the pair -- and must replay the
@@ -23,6 +23,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 pygame = pytest.importorskip("pygame")
 
 from alpha_chess.gui import (  # noqa: E402
+    LASTMOVE_COLOR,
     MARGIN,
     SQUARE,
     _AUDIO_HZ,
@@ -237,73 +238,91 @@ def test_r_key_still_resets_the_editor_in_setup_mode(surface):
 # --------------------------------------------------------------------------- #
 # Last-move highlight
 # --------------------------------------------------------------------------- #
-def _square_pixel(app, square):
-    """Colour of a square's top-left corner region, clear of any piece glyph."""
+def _border_pixel(app, square):
+    """Colour on the square's edge, where the last-move border is drawn."""
     x, y = _square_to_screen(square, app.flipped)
-    return app.surface.get_at((x + 4, y + 4))[:3]
+    return app.surface.get_at((x + 2, y + 2))[:3]
 
 
-def test_last_move_squares_are_tinted(surface):
+def _inside_pixel(app, square):
+    """Colour just inside the border, clear of both it and the piece glyph."""
+    x, y = _square_to_screen(square, app.flipped)
+    return app.surface.get_at((x + 10, y + 10))[:3]
+
+
+def test_the_square_the_piece_moved_to_is_boxed_in_green(surface):
     app = _app(surface, advisor=True)
-    app.draw()
-    before_from = _square_pixel(app, chess.E2)
-    before_to = _square_pixel(app, chess.E4)
-
     _play(app, ["e4"])
     app.draw()
-    assert _square_pixel(app, chess.E2) != before_from
-    assert _square_pixel(app, chess.E4) != before_to
+    assert _border_pixel(app, chess.E4) == LASTMOVE_COLOR
 
 
-def test_untouched_squares_are_not_tinted(surface):
+def test_the_box_is_only_a_border_not_a_fill(surface):
+    """The square's own colour must still show through inside the box."""
     app = _app(surface, advisor=True)
     app.draw()
-    before = _square_pixel(app, chess.A5)
+    plain_inside = _inside_pixel(app, chess.E4)
     _play(app, ["e4"])
     app.draw()
-    assert _square_pixel(app, chess.A5) == before
+    assert _inside_pixel(app, chess.E4) == plain_inside
 
 
-def test_the_destination_is_tinted_more_strongly_than_the_origin(surface):
-    """The piece's new home should read louder than the square it left."""
+def test_the_square_the_piece_came_from_is_left_alone(surface):
+    """Only the piece's current square is boxed."""
     app = _app(surface, advisor=True)
-    # e2, e4 and the e6 reference are all light squares, so the only
-    # difference between them is the tint.
+    app.draw()
+    before = _border_pixel(app, chess.E2)
     _play(app, ["e4"])
     app.draw()
-    plain = _square_pixel(app, chess.E6)      # same colour, untouched
-    origin = _square_pixel(app, chess.E2)
-    dest = _square_pixel(app, chess.E4)
-    assert 0 < _dist(origin, plain) < _dist(dest, plain)
+    assert _border_pixel(app, chess.E2) == before
+    assert _border_pixel(app, chess.E2) != LASTMOVE_COLOR
 
 
-def _dist(a, b):
-    return sum(abs(int(x) - int(y)) for x, y in zip(a, b))
+def test_untouched_squares_are_not_boxed(surface):
+    app = _app(surface, advisor=True)
+    app.draw()
+    before = _border_pixel(app, chess.A5)
+    _play(app, ["e4"])
+    app.draw()
+    assert _border_pixel(app, chess.A5) == before
 
 
-def test_highlight_follows_undo_and_redo(surface):
+def test_the_box_is_visible_on_both_square_colours(surface):
+    """A wash-out on one of the two square colours is the whole point here."""
+    app = _app(surface, advisor=True)
+    _play(app, ["e4"])          # e4 is a light square
+    app.draw()
+    assert _border_pixel(app, chess.E4) == LASTMOVE_COLOR
+    _play(app, ["d5", "exd5"])  # d5 is a dark square
+    app.draw()
+    assert _border_pixel(app, chess.D5) == LASTMOVE_COLOR
+
+
+def test_box_follows_undo_and_redo(surface):
     """It is read off the move stack, so it must never go stale."""
     app = _app(surface, advisor=True)
     _play(app, ["e4", "e5"])
     app.draw()
-    tinted_e5 = _square_pixel(app, chess.E5)
+    assert _border_pixel(app, chess.E5) == LASTMOVE_COLOR
 
     app._undo()
     app.draw()
-    assert _square_pixel(app, chess.E5) != tinted_e5   # no longer the last move
+    assert _border_pixel(app, chess.E5) != LASTMOVE_COLOR
+    assert _border_pixel(app, chess.E4) == LASTMOVE_COLOR   # back to 1.e4
 
     app._redo()
     app.draw()
-    assert _square_pixel(app, chess.E5) == tinted_e5
+    assert _border_pixel(app, chess.E5) == LASTMOVE_COLOR
 
 
-def test_no_highlight_on_a_fresh_board(surface):
+def test_no_box_on_a_fresh_board(surface):
     app = _app(surface, advisor=True)
     app.draw()
-    baseline = {sq: _square_pixel(app, sq) for sq in chess.SQUARES}
+    baseline = {sq: _border_pixel(app, sq) for sq in chess.SQUARES}
+    _play(app, ["e4"])
     app._new_game()
     app.draw()
-    assert {sq: _square_pixel(app, sq) for sq in chess.SQUARES} == baseline
+    assert {sq: _border_pixel(app, sq) for sq in chess.SQUARES} == baseline
 
 
 # --------------------------------------------------------------------------- #

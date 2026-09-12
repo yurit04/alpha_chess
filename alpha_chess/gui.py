@@ -50,7 +50,8 @@ COORD_COLOR = (206, 197, 184)      # coordinate labels drawn in the margin
 SEL_COLOR = (246, 232, 96)         # selected square highlight
 DEST_COLOR = (90, 150, 70)         # legal-destination marker
 HINT_COLOR = (74, 144, 226)        # hint / analysis from-to highlight
-LASTMOVE_COLOR = (255, 205, 80)    # from/to of the move just played
+LASTMOVE_COLOR = (54, 211, 92)     # border around the piece that just moved
+LASTMOVE_WIDTH = 5                 # thickness of that border, in pixels
 PANEL_BG = (40, 40, 45)
 PANEL_FG = (230, 230, 230)
 PANEL_DIM = (170, 170, 175)
@@ -1224,17 +1225,17 @@ def _draw(
     # --- board backdrop + squares ---
     _draw_board_backdrop(pygame, screen, flipped)
 
-    # --- last move played (translucent, under every other highlight) ---
-    # Read straight off the move stack rather than tracked separately, so undo,
-    # redo and new-game need no bookkeeping to keep it honest. Whenever it is
-    # your turn, the move shown is your opponent's. The destination is tinted
-    # more strongly than the origin: that is where the piece now stands.
+    # --- the piece that just moved, boxed in green ---
+    # A translucent tint washes out against both square colours, so this is a
+    # hard-edged border on the destination only -- the square the piece now
+    # occupies. Read straight off the move stack rather than tracked
+    # separately, so undo, redo and new-game need no bookkeeping to keep it
+    # honest. Whenever it is your turn, the piece boxed is your opponent's.
     last = board.move_stack[-1] if board.move_stack else None
     if last is not None:
-        _fill_square(pygame, screen, last.from_square, flipped,
-                     (*LASTMOVE_COLOR, 45))
-        _fill_square(pygame, screen, last.to_square, flipped,
-                     (*LASTMOVE_COLOR, 75))
+        x, y = _square_to_screen(last.to_square, flipped)
+        pygame.draw.rect(screen, LASTMOVE_COLOR,
+                         (x, y, SQUARE, SQUARE), LASTMOVE_WIDTH)
 
     # --- selected square highlight (translucent) ---
     if selected is not None:
