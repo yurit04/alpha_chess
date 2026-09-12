@@ -2,7 +2,7 @@
 
 Modes:
 
-* **play**  -- click to move against the agent (H=hint, U=undo, ...).
+* **play**  -- click to move against the agent (H=hint, U=undo, R=redo, ...).
 * **advisor** -- a variant of play mode (``mode == "play"`` with
   ``advisor=True``): the user makes every move for BOTH colours -- mirroring a
   game played in a separate application -- and asks the engine for the best
@@ -373,6 +373,9 @@ class _GuiApp:
         self.eval_msg = ""
         self.hint_info: List[str] = []
         self.thinking = False
+        # Plies taken back by Undo, newest first, so Redo can replay them.
+        # Cleared whenever a move is played onto a different line.
+        self.redo_stack: List[chess.Move] = []
 
         # ----- setup-mode state -----
         self.mode = "play"
@@ -551,6 +554,7 @@ class _GuiApp:
 
     def _new_game(self) -> None:
         self.board = chess.Board()
+        self.redo_stack.clear()
         self._clear_selection()
         self.hint_squares = None
         self.eval_msg = ""
@@ -563,7 +567,35 @@ class _GuiApp:
         plies = 1 if (self.advisor or self.agent is None) else 2
         for _ in range(plies):
             if self.board.move_stack:
-                self.board.pop()
+                self.redo_stack.append(self.board.pop())
+        self._clear_selection()
+        self.hint_squares = None
+        self.hint_info = []
+        self._refresh_status()
+
+    def _redo(self) -> None:
+        """Replay plies taken back by Undo, in the order they were played.
+
+        Undo pops a human/agent pair when playing against the agent, so Redo
+        restores the pair too -- the agent's reply is replayed rather than
+        re-searched, which keeps Redo instant and exactly reverses the Undo.
+        """
+        if not self.redo_stack:
+            self.status_msg = "Nothing to redo"
+            return
+        plies = 1 if (self.advisor or self.agent is None) else 2
+        for _ in range(plies):
+            if not self.redo_stack:
+                break
+            move = self.redo_stack[-1]
+            if move not in self.board.legal_moves:
+                # The board moved onto a different line (or was replaced by the
+                # editor) since these plies were taken back; drop them.
+                self.redo_stack.clear()
+                self.status_msg = "Nothing to redo"
+                break
+            self.redo_stack.pop()
+            self.board.push(move)
         self._clear_selection()
         self.hint_squares = None
         self.hint_info = []
@@ -609,6 +641,12 @@ class _GuiApp:
         else:
             move = _build_move(self.board, self.selected, sq)
             if move is not None and move in self.board.legal_moves:
+                if not self.redo_stack or move != self.redo_stack[-1]:
+                    # Playing something other than what Undo took back starts a
+                    # new line, so the taken-back plies are no longer reachable.
+                    self.redo_stack.clear()
+                else:
+                    self.redo_stack.pop()
                 self.board.push(move)
                 self._clear_selection()
                 self.hint_squares = None
@@ -632,6 +670,10 @@ class _GuiApp:
                     self.eval_msg = "eval: %+.3f" % float(info.get("value", 0.0))
                 except Exception:
                     self.eval_msg = ""
+                if self.redo_stack and move == self.redo_stack[-1]:
+                    self.redo_stack.pop()
+                else:
+                    self.redo_stack.clear()
                 self.board.push(move)
         except Exception as exc:  # pragma: no cover - defensive
             self.status_msg = "Agent error: %s" % exc
@@ -677,6 +719,7 @@ class _GuiApp:
             return
         # Adopt as a fresh game (empty move stack) and switch to play mode.
         self.board = board
+        self.redo_stack.clear()
         self.mode = "play"
         self._clear_selection()
         self.hint_squares = None
@@ -753,6 +796,8 @@ class _GuiApp:
                 self.flipped = not self.flipped
             elif key == K.K_u:
                 self._undo()
+            elif key == K.K_r:
+                self._redo()
             elif key in (K.K_h, K.K_SPACE, K.K_a):
                 self._hint()
         else:  # setup mode
@@ -1153,7 +1198,7 @@ def _draw(
         help_lines = [
             "H / SPACE - best move",
             "click - move either side",
-            "U - undo",
+            "U / R - undo / redo",
             "E - set up position",
             "F - flip",
             "N - new game",
@@ -1162,7 +1207,7 @@ def _draw(
     else:
         help_lines = [
             "H - hint",
-            "U - undo",
+            "U / R - undo / redo",
             "N - new game",
             "F - flip board",
             "E - setup / editor",

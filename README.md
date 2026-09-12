@@ -102,7 +102,7 @@ The examples below use `.venv/bin/python`; if you've activated the venv
 .venv/bin/python -m alpha_chess.cli evaluate \
   --model models/best.pt --opponent random --games 20 --simulations 40
 
-# 3) Play against it in a window (H = hint, U = undo, N = new game, F = flip)
+# 3) Play in a window (H = hint, U/R = undo/redo, N = new game, F = flip)
 .venv/bin/python -m alpha_chess.cli play --model models/best.pt
 
 # 4) Ask for the best move in any position (FEN)
@@ -593,6 +593,9 @@ falls back to **human vs human** with the agent and hints disabled.
 - **H** / **SPACE** / **A** — hint: highlights the engine's suggested move and
   shows its evaluation and top candidates in the side panel.
 - **U** — undo the last move (a full human+agent pair when playing the engine).
+- **R** — redo a move taken back with **U**, restoring the same pair. The
+  agent's reply is replayed, not re-searched, so redo exactly reverses the undo
+  and is instant. Playing a different move instead discards the redo history.
 - **N** — new game.
 - **F** — flip the board.
 - **E** — enter the **board editor** (see below).
@@ -631,6 +634,8 @@ works for making moves; asking for a suggestion just shows
   (`[-1, +1]`, side-to-move perspective), and the top 5 candidates with their
   visit-count percentages. Re-runnable after every move.
 - **U** — undo the last move (a **single** ply — you made it).
+- **R** — redo a ply taken back with **U**. Playing a different move instead
+  discards the redo history.
 - **E** — open the **board editor** (below) to set up a mid-game position when
   you join a game already in progress.
 - **F** — flip the board.  **N** — new game (standard start position).
@@ -1082,6 +1087,7 @@ tests/
   test_mcts.py         interactive search: terminal handling, mate-in-one, caching
   test_native.py       perft + native-vs-Python parity for movegen, indices and planes
   test_evaluate.py     Elo estimation and UCI strength limiting (clamping, skill level)
+  test_gui.py          GUI undo/redo history, headless (no window opened)
 requirements.txt
 README.md
 ```
@@ -1140,6 +1146,16 @@ floor, an out-of-range skill is clamped, the two throttles are refused
 together, and the match label names the setting actually applied rather than
 the one requested. The engine-backed tests skip when no UCI engine is
 installed.
+
+`test_gui.py` pins the undo/redo history, headless against an offscreen
+surface: that redo restores exactly the plies undo took back (the human+agent
+pair when playing the engine, a single ply in advisor and human-vs-human
+modes), that it replays the agent's *recorded* reply rather than re-searching
+— so redo is a true inverse even for a stochastic agent — and that the redo
+history is discarded whenever the game moves onto a different line: a
+different move played by hand, a new game, or a position adopted from the
+editor. It also checks `R` is redo in play mode while still resetting the
+editor in setup mode.
 
 ---
 
