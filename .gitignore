@@ -221,6 +221,7 @@ __marimo__/
 models/
 models_smoke/
 models_smoke_gpu/
+models_exp/
 
 # macOS
 .DS_Store
