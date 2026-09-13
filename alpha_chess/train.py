@@ -215,6 +215,9 @@ def train(
     fast_simulations: int = 50,
     full_search_prob: float = 0.25,
     fpu_reduction: float = 0.0,
+    dirichlet_alpha: float = 0.3,
+    dirichlet_epsilon: float = 0.25,
+    noise_all_plies: bool = False,
     sample_reuse: float = 4.0,
     train_steps: int = 0,
     resign_threshold: Optional[float] = -0.90,
@@ -275,6 +278,14 @@ def train(
             below this; ``None`` plays every game to the end.
         resign_disable_fraction: Fraction of games played out with resignation
             suppressed, to measure the resign false-positive rate.
+        dirichlet_alpha: Shape of the root Dirichlet noise.
+        dirichlet_epsilon: Weight of that noise in the root priors. Exploration
+            has to compete with the policy's own confidence, so a policy that
+            has sharpened needs more of it, not the same amount.
+        noise_all_plies: Apply root noise on every ply rather than only on the
+            plies that also record a training target. Noise is free; only
+            recording costs anything, so bundling them leaves most of the moves
+            actually played with no exploration at all.
         save_buffer: Persist the replay buffer alongside ``train_state.pt`` so a
             resumed run keeps its training history.
         lr_final: Final learning rate for cosine decay (defaults to ``lr*0.1``).
@@ -454,6 +465,8 @@ def train(
             c_puct=1.5,
             temperature_moves=temperature_moves,
             max_moves=max_moves,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
             resign_threshold=resign_threshold,
             resign_disable_fraction=resign_disable_fraction,
             seed=selfplay_seed,
@@ -467,6 +480,7 @@ def train(
                 fast_simulations=fast_simulations,
                 full_search_prob=full_search_prob,
                 fpu_reduction=fpu_reduction,
+                noise_all_plies=bool(noise_all_plies),
                 **common
             )
         else:

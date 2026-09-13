@@ -259,3 +259,76 @@ def test_resignation_is_off_when_no_threshold_is_given():
     )
     _run_engine(engine, _uniform)
     assert engine.stats()["resigned"] == 0
+
+
+def _uniform_eval(n, states, idx, counts, priors, values):
+    for i in range(n):
+        c = int(counts[i])
+        priors[i, :c] = 1.0 / max(c, 1)
+        values[i] = 0.0
+
+
+def _noise_stats(**kwargs):
+    engine = fc.Engine(
+        games_in_flight=4, num_games=8, num_simulations=8, fast_simulations=2,
+        full_search_prob=0.25, max_moves=40, resign_threshold=None, seed=3,
+        **kwargs,
+    )
+    _run_engine(engine, _uniform_eval)
+    st = engine.stats()
+    assert st["fast_plies"] > 0, st          # playout caps really engaged
+    return st
+
+
+def test_root_noise_defaults_to_recorded_plies_only():
+    """The historical behaviour: noise rides along with target recording.
+
+    ``noise_plies`` can fall a little short of ``full_plies`` because a game's
+    last ply is counted when it starts but ends terminally before the root is
+    expanded and noise is applied. What matters is that it never EXCEEDS the
+    recorded plies -- i.e. no fast ply ever gets noise.
+    """
+    st = _noise_stats()
+    assert st["noise_plies"] <= st["full_plies"], st
+    assert st["noise_plies"] > 0, st
+    # ...and that is the gap: most plies played carry no exploration noise.
+    assert st["noise_plies"] < 0.5 * (st["full_plies"] + st["fast_plies"]), st
+
+
+def test_noise_all_plies_covers_the_plies_that_recording_skips():
+    st = _noise_stats(noise_all_plies=1)
+    assert st["noise_plies"] > st["full_plies"], st
+    assert st["noise_plies"] <= st["full_plies"] + st["fast_plies"], st
+    # Nearly everything played is now explored, not a quarter of it.
+    assert st["noise_plies"] > 0.9 * (st["full_plies"] + st["fast_plies"]), st
+
+
+def test_noise_all_plies_leaves_the_recording_budget_alone():
+    """It must move exploration only.
+
+    The games themselves necessarily differ -- that is the point of the flag --
+    so the invariant is the *share* of plies that record a target, not the
+    counts, which shift with the games that get played.
+    """
+    for kwargs in ({}, {"noise_all_plies": 1}):
+        st = _noise_stats(**kwargs)
+        share = st["full_plies"] / (st["full_plies"] + st["fast_plies"])
+        assert 0.15 < share < 0.4, (kwargs, share, st)
+        # Recorded examples still track full-search plies exactly.
+        assert st["plies"] == st["full_plies"], st
+
+
+def test_dirichlet_epsilon_changes_the_games_that_are_played():
+    """Noise weight must reach the search, not just the constructor."""
+    def run(eps):
+        e = fc.Engine(
+            games_in_flight=4, num_games=4, num_simulations=16, max_moves=60,
+            full_search_prob=1.0, dirichlet_epsilon=eps, resign_threshold=None,
+            seed=9,
+        )
+        _run_engine(e, _uniform_eval)
+        return e.stats()["plies"]
+
+    # Same seed, same evaluator: only the noise weight differs. With uniform
+    # priors, no noise makes selection tie-break identically every game.
+    assert run(0.0) != run(0.95)

@@ -269,6 +269,9 @@ architecture from each checkpoint's stored config, so any size just works.
 | `--fast-simulations` | `50` | Simulation budget for plies that playout-cap randomisation does not search fully. Native engine only. |
 | `--full-search-prob` | `0.25` | Probability a ply gets the full `--simulations` budget, root Dirichlet noise, and a recorded training target. See [playout-cap randomisation](#playout-cap-randomisation). Native engine only. |
 | `--no-playout-cap` | off | Shorthand for `--full-search-prob 1.0`: search every ply fully (classic AlphaZero). |
+| `--dirichlet-epsilon` | `0.25` | Weight of the root Dirichlet noise in the priors. Exploration competes with the policy's own confidence, so a policy that has sharpened needs **more** of it. Raising this **cannot un-collapse** an already-peaked policy — it is preventive, not curative. |
+| `--dirichlet-alpha` | `0.3` | Shape of that noise (lower = spikier, concentrating it on fewer moves). |
+| `--noise-all-plies` | off | Apply root noise on **every** ply, not only on the plies that also record a training target. Noise is free; only recording costs anything, so the default leaves ~75% of the moves actually played with no exploration at all. Native engine only. |
 | `--fpu-reduction` | `0.0` | First-play-urgency penalty for unvisited children. `0` treats them as drawn (AlphaZero); `0.2`-`0.3` makes the search commit to promising moves sooner. Native engine only. |
 | `--num-workers` | ¾ of CPU count, capped at 24 | Search **processes** for the *Python* engine only; that search is GIL-bound, so it is that engine's main throughput lever. The native core ignores it. |
 | `--pipeline-stages` | `4` | Sub-pools per worker (Python engine only). |
@@ -378,6 +381,14 @@ Notes on the knobs:
   old rule (one pass over the whole replay buffer per epoch) drew every position
   ~20 times per iteration once the buffer filled, which is both slow and more
   reuse than the data supports.
+- **Exploration is the thing to watch.** A self-play loop can collapse onto a
+  single opening: the policy sharpens, the visit counts it produces sharpen with
+  it, and those visit counts are the training target. Measured on one 160-
+  iteration run here, the share of games opening with the *same* move went 6.6%
+  → 49% → 94% → 98.3% by iteration 160, and the model at iteration 160 was no
+  stronger than the one at iteration 10. `--dirichlet-epsilon` and
+  `--noise-all-plies` exist to widen exploration; both must be set **from the
+  start**, because neither can recover a policy that has already collapsed.
 - **`--resign-threshold`** cuts decided games short, which is a large share of
   the win at long time controls. The iteration log prints the false-positive
   rate measured on the `--resign-disable-fraction` of games played out anyway;

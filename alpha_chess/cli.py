@@ -78,6 +78,21 @@ def _add_train_parser(subparsers: argparse._SubParsersAction) -> None:
                    action="store_const", const=1.0,
                    help="Search every ply fully (classic AlphaZero); "
                         "equivalent to --full-search-prob 1.0.")
+    p.add_argument("--dirichlet-epsilon", type=float, default=0.25,
+                   help="Weight of the root Dirichlet noise in the priors. "
+                        "Exploration competes with the policy's own "
+                        "confidence, so a policy that has sharpened needs "
+                        "MORE than one that has not.")
+    p.add_argument("--dirichlet-alpha", type=float, default=0.3,
+                   help="Shape of the root Dirichlet noise (lower = spikier, "
+                        "concentrating the noise on fewer moves).")
+    p.add_argument("--noise-all-plies", dest="noise_all_plies",
+                   action="store_true", default=False,
+                   help="Apply root noise on EVERY ply, not only on the plies "
+                        "that also record a training target. With "
+                        "--full-search-prob 0.25 the default leaves three "
+                        "quarters of the moves actually played with no "
+                        "exploration noise. Native engine only.")
     p.add_argument("--fpu-reduction", type=float, default=0.0,
                    help="First-play-urgency penalty for unvisited children. "
                         "0 treats them as drawn (AlphaZero); 0.2-0.3 makes "
@@ -276,6 +291,9 @@ def _run_train(args: argparse.Namespace) -> None:
         fast_simulations=args.fast_simulations,
         full_search_prob=args.full_search_prob,
         fpu_reduction=args.fpu_reduction,
+        dirichlet_alpha=args.dirichlet_alpha,
+        dirichlet_epsilon=args.dirichlet_epsilon,
+        noise_all_plies=args.noise_all_plies,
         sample_reuse=args.sample_reuse,
         train_steps=args.train_steps,
         resign_threshold=args.resign_threshold if args.resign else None,

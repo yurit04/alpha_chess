@@ -363,6 +363,7 @@ typedef struct {
     double c_puct;
     double dirichlet_alpha, dirichlet_epsilon;
     double fpu_reduction;
+    int noise_all_plies;
     int temperature_moves;
     int max_moves;
     int use_resign;
@@ -393,7 +394,7 @@ typedef struct {
 
     double st_games, st_plies, st_evals;
     double st_resigned, st_resign_checked, st_resign_fp;
-    double st_full_plies, st_fast_plies;
+    double st_full_plies, st_fast_plies, st_noise_plies;
 
     RNG rng;
     double *noise_buf;
@@ -556,13 +557,18 @@ static void add_root_noise(Engine *e, Game *g)
 static void start_ply(Engine *e, Game *g, int carried_visits)
 {
     /* Playout-cap randomisation: a random subset of plies gets the full
-     * budget, root noise and a training target; the rest run cheap. */
+     * budget and a training target; the rest run cheap. */
     g->record_ply = (e->full_search_prob >= 1.0)
                   || (rng_double(&e->rng) < e->full_search_prob);
     int target = g->record_ply ? e->num_simulations : e->fast_simulations;
     int left = target - carried_visits;
     g->sims_left = left > 1 ? left : 1;
-    g->noise_pending = g->record_ply;
+    /* Root noise is what makes self-play games diverge, and it is free --- only
+     * *recording* a ply costs anything. Bundling the two means that at
+     * full_search_prob 0.25 three quarters of the moves actually played carry
+     * no exploration noise at all, which lets the policy collapse onto one
+     * opening. ``noise_all_plies`` unbundles them. */
+    g->noise_pending = g->record_ply || e->noise_all_plies;
     if (g->record_ply) e->st_full_plies += 1.0; else e->st_fast_plies += 1.0;
 }
 
@@ -897,6 +903,7 @@ static float advance_game(Engine *e, Game *g)
     start_ply(e, g, carried);
     if (g->arena.nodes[g->root].expanded && g->noise_pending) {
         add_root_noise(e, g);
+        e->st_noise_plies += 1.0;
         g->noise_pending = 0;
     }
     return 2.0f;

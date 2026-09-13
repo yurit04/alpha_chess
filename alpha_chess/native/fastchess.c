@@ -81,14 +81,16 @@ static int Engine_init(EngineObject *self, PyObject *args, PyObject *kwds)
     static char *kwlist[] = {
         "games_in_flight", "num_games", "num_simulations", "fast_simulations",
         "full_search_prob", "c_puct", "dirichlet_alpha", "dirichlet_epsilon",
-        "fpu_reduction", "temperature_moves", "max_moves", "resign_threshold",
-        "resign_plies", "resign_disable_fraction", "seed", NULL
+        "fpu_reduction", "noise_all_plies", "temperature_moves", "max_moves",
+        "resign_threshold", "resign_plies", "resign_disable_fraction", "seed",
+        NULL
     };
     int games_in_flight = 64;
     long num_games = 64;
     int num_simulations = 200, fast_simulations = 50;
     double full_search_prob = 1.0, c_puct = 1.5;
     double dirichlet_alpha = 0.3, dirichlet_epsilon = 0.25, fpu_reduction = 0.0;
+    int noise_all_plies = 0;
     int temperature_moves = 30, max_moves = 400;
     PyObject *resign_obj = Py_None;
     int resign_plies = 2;
@@ -96,11 +98,11 @@ static int Engine_init(EngineObject *self, PyObject *args, PyObject *kwds)
     unsigned long long seed = 0;
 
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwds, "|iliidddddiiOidK", kwlist,
+            args, kwds, "|iliidddddiiiOidK", kwlist,
             &games_in_flight, &num_games, &num_simulations, &fast_simulations,
             &full_search_prob, &c_puct, &dirichlet_alpha, &dirichlet_epsilon,
-            &fpu_reduction, &temperature_moves, &max_moves, &resign_obj,
-            &resign_plies, &resign_disable_fraction, &seed))
+            &fpu_reduction, &noise_all_plies, &temperature_moves, &max_moves,
+            &resign_obj, &resign_plies, &resign_disable_fraction, &seed))
         return -1;
 
     if (games_in_flight < 1) games_in_flight = 1;
@@ -119,6 +121,7 @@ static int Engine_init(EngineObject *self, PyObject *args, PyObject *kwds)
     e->dirichlet_alpha = dirichlet_alpha;
     e->dirichlet_epsilon = dirichlet_epsilon;
     e->fpu_reduction = fpu_reduction;
+    e->noise_all_plies = noise_all_plies ? 1 : 0;
     e->temperature_moves = temperature_moves;
     e->max_moves = max_moves;
     if (resign_obj == Py_None) {
@@ -295,7 +298,7 @@ static PyObject *Engine_stats(EngineObject *self, PyObject *Py_UNUSED(ignored))
 {
     Engine *e = &self->e;
     return Py_BuildValue(
-        "{s:d,s:d,s:d,s:d,s:d,s:d,s:d,s:d}",
+        "{s:d,s:d,s:d,s:d,s:d,s:d,s:d,s:d,s:d}",
         "games", e->st_games,
         "plies", e->st_plies,
         "evals", e->st_evals,
@@ -303,7 +306,8 @@ static PyObject *Engine_stats(EngineObject *self, PyObject *Py_UNUSED(ignored))
         "resign_checked", e->st_resign_checked,
         "resign_false_pos", e->st_resign_fp,
         "full_plies", e->st_full_plies,
-        "fast_plies", e->st_fast_plies);
+        "fast_plies", e->st_fast_plies,
+        "noise_plies", e->st_noise_plies);
 }
 
 static PyObject *Engine_pending(EngineObject *self, PyObject *Py_UNUSED(ignored))
