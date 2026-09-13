@@ -29,6 +29,9 @@ from alpha_chess.gui import (  # noqa: E402
     PANEL_BG,
     PANEL_PX,
     SQUARE,
+    WINDOW_H,
+    WINDOW_W,
+    _ui,
     _AUDIO_HZ,
     _GuiApp,
     _click_samples,
@@ -51,7 +54,9 @@ class _FirstMoveAgent:
 def surface():
     pygame.init()
     pygame.font.init()
-    return pygame.Surface((1200, 800))
+    # Match the real window, which SCALE changes; a fixed size would clip the
+    # panel and break the pixel assertions the moment the interface is resized.
+    return pygame.Surface((WINDOW_W, WINDOW_H))
 
 
 def _app(surface, **kwargs):
@@ -493,7 +498,8 @@ def test_the_panel_shows_the_capture_rows(surface):
     """Something must actually be drawn, not just computed."""
     app = _app(surface, advisor=True)
     app.draw()
-    panel = pygame.Rect(BOARD_PX, 130, PANEL_PX, 60)
+    # Scale-relative, so this keeps pointing at the capture rows if SCALE moves.
+    panel = pygame.Rect(BOARD_PX, _ui(130), PANEL_PX, _ui(60))
     before = app.surface.subsurface(panel).copy()
 
     _play(app, ["e4", "d5", "exd5"])
@@ -511,5 +517,36 @@ def test_many_captures_stay_inside_the_panel(surface):
     app.draw()                                  # must not raise or overflow
     # The rightmost panel column stays panel-coloured: nothing drew past it.
     edge = BOARD_PX + PANEL_PX - 2
-    for yy in range(130, 190):
+    for yy in range(_ui(130), _ui(190)):
         assert app.surface.get_at((edge, yy))[:3] == PANEL_BG
+
+
+# --------------------------------------------------------------------------- #
+# Interface scale
+# --------------------------------------------------------------------------- #
+def test_layout_geometry_is_consistent_at_the_current_scale():
+    from alpha_chess.gui import GRID
+    assert GRID == SQUARE * 8
+    assert BOARD_PX == GRID + 2 * MARGIN
+    assert WINDOW_W == BOARD_PX + PANEL_PX
+    assert WINDOW_H == BOARD_PX
+
+
+def test_every_square_maps_back_to_itself_at_the_current_scale(surface):
+    """A scale change must not break the pixel↔square mapping."""
+    from alpha_chess.gui import _screen_to_square
+    for flipped in (False, True):
+        for sq in chess.SQUARES:
+            x, y = _square_to_screen(sq, flipped)
+            centre = (x + SQUARE // 2, y + SQUARE // 2)
+            assert _screen_to_square(centre, flipped) == sq
+
+
+def test_the_bottom_help_block_fits_inside_the_window(surface):
+    """Larger fonts must not push the pinned help off the bottom edge."""
+    app = _app(surface, advisor=True)
+    app.draw()
+    # The last help row is drawn above WINDOW_H; nothing should be clipped.
+    assert app.surface.get_height() == WINDOW_H
+    bottom_strip = [app.surface.get_at((BOARD_PX + _ui(14) + 2, WINDOW_H - 1))[:3]]
+    assert bottom_strip == [PANEL_BG]      # clear margin below the last line

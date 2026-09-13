@@ -30,16 +30,29 @@ import chess
 # ---------------------------------------------------------------------------
 # Layout / drawing constants
 # ---------------------------------------------------------------------------
-MARGIN = 24                        # coordinate border around the 8x8 grid
-SQUARE = 74                        # size of a single square
-GRID = SQUARE * 8                  # 8x8 playing area (592 px)
-BOARD_PX = GRID + 2 * MARGIN       # board region incl. margins (640 px)
-PANEL_PX = 240                     # width of the side panel
+# Every pixel measurement below is a *design unit* at SCALE 1.0, and is passed
+# through _ui() before use. Changing SCALE resizes the whole interface --- board,
+# panel, fonts and spacing together --- without touching any layout code. Fonts
+# are re-rendered at the scaled size rather than the window being upscaled, so
+# text and piece glyphs stay sharp.
+SCALE = 1.5
+
+
+def _ui(value: float) -> int:
+    """Scale a design-unit measurement to device pixels."""
+    return int(round(value * SCALE))
+
+
+MARGIN = _ui(24)                   # coordinate border around the 8x8 grid
+SQUARE = _ui(74)                   # size of a single square
+GRID = SQUARE * 8                  # 8x8 playing area
+BOARD_PX = GRID + 2 * MARGIN       # board region incl. margins
+PANEL_PX = _ui(240)                # width of the side panel
 WINDOW_W = BOARD_PX + PANEL_PX
 WINDOW_H = BOARD_PX
 FPS = 30
 
-PALETTE_CELL = 30                  # size of a palette cell in setup mode
+PALETTE_CELL = _ui(30)             # size of a palette cell in setup mode
 
 # Colours (R, G, B)
 LIGHT_SQ = (235, 210, 173)
@@ -51,7 +64,7 @@ SEL_COLOR = (246, 232, 96)         # selected square highlight
 DEST_COLOR = (90, 150, 70)         # legal-destination marker
 HINT_COLOR = (74, 144, 226)        # hint / analysis from-to highlight
 LASTMOVE_COLOR = (54, 211, 92)     # border around the piece that just moved
-LASTMOVE_WIDTH = 5                 # thickness of that border, in pixels
+LASTMOVE_WIDTH = _ui(5)            # thickness of that border, in pixels
 CAPTURED_LABEL = (150, 150, 158)   # "White"/"Black" labels on the capture rows
 CAPTURED_CHIP = (74, 74, 82)       # strip behind them, so black pieces are visible
 LEAD_COLOR = (250, 220, 120)       # the +N material advantage
@@ -498,11 +511,11 @@ class _GuiApp:
         self.advisor = advisor
 
         self.renderer = _Renderer(pygame)
-        self.panel_font = pygame.font.SysFont("Arial", 20)
-        self.panel_small = pygame.font.SysFont("Arial", 15)
-        self.panel_tiny = pygame.font.SysFont("Arial", 13)
-        self.panel_bold = pygame.font.SysFont("Arial", 22, bold=True)
-        self.coord_font = pygame.font.SysFont("Arial", 14, bold=True)
+        self.panel_font = pygame.font.SysFont("Arial", _ui(20))
+        self.panel_small = pygame.font.SysFont("Arial", _ui(15))
+        self.panel_tiny = pygame.font.SysFont("Arial", _ui(13))
+        self.panel_bold = pygame.font.SysFont("Arial", _ui(22), bold=True)
+        self.coord_font = pygame.font.SysFont("Arial", _ui(14), bold=True)
 
         # ----- play-mode state -----
         self._fen_error: Optional[str] = None
@@ -564,11 +577,11 @@ class _GuiApp:
         """Compute the palette cell rects (panel/screen coords, flip-agnostic)."""
         Rect = self.pygame.Rect
         cell = PALETTE_CELL
-        gap = 3
-        x0 = BOARD_PX + 12
-        self.palette_white_y = 120
-        self.palette_black_y = self.palette_white_y + cell + 6
-        self.palette_eraser_y = self.palette_black_y + cell + 6
+        gap = _ui(3)
+        x0 = BOARD_PX + _ui(12)
+        self.palette_white_y = _ui(120)
+        self.palette_black_y = self.palette_white_y + cell + _ui(6)
+        self.palette_eraser_y = self.palette_black_y + cell + _ui(6)
         self.palette_cells: List[Tuple[object, str]] = []
         for i, s in enumerate(["K", "Q", "R", "B", "N", "P"]):
             self.palette_cells.append(
@@ -1094,13 +1107,13 @@ class _GuiApp:
 
         # --- side panel ---
         pygame.draw.rect(screen, PANEL_BG, (BOARD_PX, 0, PANEL_PX, WINDOW_H))
-        px = BOARD_PX + 12
-        y = 12
+        px = BOARD_PX + _ui(12)
+        y = _ui(12)
 
         def line(text: str, font, color=PANEL_FG, dy: int = 24) -> None:
             nonlocal y
             screen.blit(font.render(text, True, color), (px, y))
-            y += dy
+            y += _ui(dy)
 
         line("SETUP MODE", self.panel_bold, PANEL_ACCENT, dy=30)
         side = "White to move" if self.setup_turn == chess.WHITE else "Black to move"
@@ -1113,14 +1126,14 @@ class _GuiApp:
         self._draw_palette()
 
         # status + suggestions below the palette
-        y = self.palette_eraser_y + PALETTE_CELL + 12
+        y = self.palette_eraser_y + PALETTE_CELL + _ui(12)
         if self.agent is None and self.agent_error:
-            for ln in self._wrap(self.agent_error, self.panel_tiny, PANEL_PX - 24):
+            for ln in self._wrap(self.agent_error, self.panel_tiny, PANEL_PX - _ui(24)):
                 line(ln, self.panel_tiny, PANEL_ERR, dy=17)
-            y += 4
+            y += _ui(4)
         if self.setup_status:
             col = PANEL_ERR if self._status_is_error else PANEL_INFO
-            for ln in self._wrap(self.setup_status, self.panel_small, PANEL_PX - 24):
+            for ln in self._wrap(self.setup_status, self.panel_small, PANEL_PX - _ui(24)):
                 line(ln, self.panel_small, col, dy=20)
         for ln in self.suggest_lines:
             line(ln, self.panel_small, PANEL_INFO, dy=20)
@@ -1134,10 +1147,10 @@ class _GuiApp:
             "K - clear castling  F - flip",
             "E/ESC - exit setup   Q - quit",
         ]
-        hy = WINDOW_H - 17 * len(help_lines) - 10
+        hy = WINDOW_H - _ui(17) * len(help_lines) - _ui(10)
         for text in help_lines:
             screen.blit(self.panel_tiny.render(text, True, PANEL_DIM), (px, hy))
-            hy += 17
+            hy += _ui(17)
 
     # ------------------------------------------------------------------- loop
     def run(self, clock) -> None:
@@ -1353,23 +1366,23 @@ def _draw(
 
     # --- side panel ---
     pygame.draw.rect(screen, PANEL_BG, (BOARD_PX, 0, PANEL_PX, WINDOW_H))
-    px = BOARD_PX + 14
-    y = 16
+    px = BOARD_PX + _ui(14)
+    y = _ui(16)
 
     def line(text: str, font, color=PANEL_FG, dy: int = 26) -> None:
         nonlocal y
         surf = font.render(text, True, color)
         screen.blit(surf, (px, y))
-        y += dy
+        y += _ui(dy)
 
     if advisor:
         line("ADVISOR", panel_bold, PANEL_ACCENT, dy=30)
         line("You move both sides", panel_small, PANEL_DIM, dy=24)
         line(status_msg, panel_font, PANEL_FG, dy=30)
-        y += 4
+        y += _ui(4)
         # Surface any error (e.g. a bad --fen) whether or not a model is loaded.
         if agent_error:
-            for _t in _wrap_text(agent_error, panel_small, PANEL_PX - 24):
+            for _t in _wrap_text(agent_error, panel_small, PANEL_PX - _ui(24)):
                 line(_t, panel_small, (240, 160, 160), dy=22)
         if agent is None:
             line("Load a model (--model)", panel_small, PANEL_DIM, dy=22)
@@ -1383,7 +1396,7 @@ def _draw(
         elif eval_msg:
             line(eval_msg, panel_small, PANEL_DIM, dy=26)
 
-        y += 6
+        y += _ui(6)
         if agent is None:
             if agent_error:
                 line(agent_error, panel_small, (240, 160, 160), dy=22)
@@ -1397,32 +1410,34 @@ def _draw(
         screen.blit(panel_small.render(label, True, CAPTURED_LABEL), (px, y))
 
         lead_text = "+%d" % lead if lead > 0 else ""
-        lead_w = panel_small.size(lead_text)[0] + 8 if lead_text else 0
-        gx = px + 44
+        lead_w = panel_small.size(lead_text)[0] + _ui(8) if lead_text else 0
+        gx = px + _ui(44)
         # Room for the glyphs is whatever the label and the lead leave over;
         # they overlap rather than wrap when a side has taken a lot.
-        room = (BOARD_PX + PANEL_PX - 14) - gx - lead_w
-        step = min(13, room // len(taken)) if taken else 0
+        room = (BOARD_PX + PANEL_PX - _ui(14)) - gx - lead_w
+        step = min(_ui(13), room // len(taken)) if taken else 0
         if taken:
             # Black pieces are drawn black-on-dark and all but disappear
             # against the panel, so the run sits on a lighter strip.
-            run_w = step * (len(taken) - 1) + 17
+            run_w = step * (len(taken) - 1) + _ui(17)
             pygame.draw.rect(screen, CAPTURED_CHIP,
-                             (gx, y - 1, run_w, 20), border_radius=4)
+                             (gx, y - _ui(1), run_w, _ui(20)),
+                             border_radius=_ui(4))
         for piece_type in taken:
             renderer.draw_piece_at(
-                screen, chess.Piece(piece_type, colour), gx + 8, y + 8, 18)
+                screen, chess.Piece(piece_type, colour),
+                gx + _ui(8), y + _ui(8), _ui(18))
             gx += step
         if lead_text:
             surf = panel_small.render(lead_text, True, LEAD_COLOR)
             screen.blit(surf,
-                        (BOARD_PX + PANEL_PX - 14 - surf.get_width(), y))
-        y += 24
+                        (BOARD_PX + PANEL_PX - _ui(14) - surf.get_width(), y))
+        y += _ui(24)
 
     if material is not None:
         by_white, by_black, balance = material
         if by_white or by_black or balance:
-            y += 8
+            y += _ui(8)
             # A side's row shows the pieces IT captured, so the glyphs are the
             # opponent's colour.
             capture_row("White", by_white, chess.BLACK, balance)
@@ -1430,7 +1445,7 @@ def _draw(
 
     # --- hint info block (best-move suggestion) ---
     if hint_info:
-        y += 6
+        y += _ui(6)
         for text in hint_info:
             line(text, panel_small, (170, 200, 240), dy=22)
 
@@ -1456,8 +1471,8 @@ def _draw(
             "E - setup / editor",
             "ESC/Q - quit",
         ]
-    hy = WINDOW_H - 22 * len(help_lines) - 12
+    hy = WINDOW_H - _ui(22) * len(help_lines) - _ui(12)
     for text in help_lines:
         surf = panel_small.render(text, True, PANEL_DIM)
         screen.blit(surf, (px, hy))
-        hy += 22
+        hy += _ui(22)

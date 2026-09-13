@@ -608,6 +608,12 @@ falls back to **human vs human** with the agent and hints disabled.
 - **E** — enter the **board editor** (see below).
 - **ESC / Q** — quit.
 
+The window is 1320×960. Everything in the interface --- board, pieces, panel,
+fonts and spacing --- is sized from a single `SCALE` constant at the top of
+`gui.py`, currently `1.5`. Change it to resize the whole thing coherently; text
+and piece glyphs are re-rendered at the new size rather than the window being
+upscaled, so they stay sharp at any scale.
+
 The side panel lists the pieces each side has **captured**, with the material
 balance (`+3`) beside whoever is ahead. Captures are derived by replaying the
 game's moves rather than by diffing against a full starting complement, so a
@@ -1187,6 +1193,12 @@ history is discarded whenever the game moves onto a different line: a
 different move played by hand, a new game, or a position adopted from the
 editor. It also checks `R` is redo in play mode while still resetting the
 editor in setup mode.
+
+It also covers the interface scale: that the layout identities still hold, that
+every square round-trips through the pixel↔square mapping at the current
+`SCALE`, and that the pinned help block still fits inside the window when the
+fonts grow. The pixel assertions are written scale-relative so changing `SCALE`
+does not silently make them vacuous.
 
 It also covers the captured-piece panel: that en passant counts the pawn it
 actually takes (the victim is not on the destination square), that a promotion
