@@ -272,7 +272,7 @@ architecture from each checkpoint's stored config, so any size just works.
 | `--fpu-reduction` | `0.0` | First-play-urgency penalty for unvisited children. `0` treats them as drawn (AlphaZero); `0.2`-`0.3` makes the search commit to promising moves sooner. Native engine only. |
 | `--num-workers` | ¾ of CPU count, capped at 24 | Search **processes** for the *Python* engine only; that search is GIL-bound, so it is that engine's main throughput lever. The native core ignores it. |
 | `--pipeline-stages` | `4` | Sub-pools per worker (Python engine only). |
-| `--resign-threshold` | `-0.90` | Resign once the mover's best root value stays at or below this for two plies. `--no-resign` plays every game out. |
+| `--resign-threshold` | `-0.90` | Resign once a side's best root value stays at or below this for two consecutive turns **of that side** (consecutive plies alternate the mover, so a shared counter could never accumulate). `--no-resign` plays every game out. |
 | `--resign-disable-fraction` | `0.10` | Fraction of games played out with resignation suppressed, to measure the resign false-positive rate (printed each iteration). |
 | `--no-save-buffer` | off | Skip persisting the replay buffer (it is otherwise written next to `train_state.pt` so resumes keep their history). |
 | `--epochs` | `4` | Optimization passes per iteration. |

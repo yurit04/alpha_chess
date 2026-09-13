@@ -214,3 +214,48 @@ def test_native_runner_matches_batch_layout():
     assert batch.pol_idx.shape[1] == fc.MAX_POLICY_TARGETS
     assert batch.values.shape[0] == len(batch)
     assert batch.stats["games"] == 4
+
+
+def test_resignation_fires_at_the_default_ply_count():
+    """Regression: the default ``resign_plies`` must actually be reachable.
+
+    Consecutive plies alternate the side to move, and in a zero-sum game the
+    losing side's -0.95 is always followed by the winner's +0.95. The streak
+    used to be a single counter shared by both sides, so it reset on every
+    reply, could never exceed 1, and every ``resign_plies`` above 1 was
+    unsatisfiable -- resignation never fired at any threshold, in any run.
+
+    A threshold of 1.0 is above every attainable value, so the criterion is met
+    on every ply and the only thing under test is whether the streak survives
+    the opponent's turn.
+    """
+    def _uniform(n, states, idx, counts, priors, values):
+        for i in range(n):
+            c = int(counts[i])
+            priors[i, :c] = 1.0 / max(c, 1)
+            values[i] = 0.0
+
+    for resign_plies in (1, 2, 3):
+        engine = fc.Engine(
+            games_in_flight=4, num_games=4, num_simulations=8, max_moves=200,
+            resign_threshold=1.0, resign_plies=resign_plies,
+            resign_disable_fraction=0.0, seed=5,
+        )
+        _run_engine(engine, _uniform)
+        stats = engine.stats()
+        assert stats["resigned"] == 4, (resign_plies, stats)
+
+
+def test_resignation_is_off_when_no_threshold_is_given():
+    def _uniform(n, states, idx, counts, priors, values):
+        for i in range(n):
+            c = int(counts[i])
+            priors[i, :c] = 1.0 / max(c, 1)
+            values[i] = 0.0
+
+    engine = fc.Engine(
+        games_in_flight=4, num_games=4, num_simulations=8, max_moves=40,
+        resign_threshold=None, resign_disable_fraction=0.0, seed=5,
+    )
+    _run_engine(engine, _uniform)
+    assert engine.stats()["resigned"] == 0

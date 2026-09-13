@@ -241,7 +241,7 @@ def test_parallel_matches_single_process_contract(tmp_path):
 # Resignation
 # --------------------------------------------------------------------------- #
 def test_should_resign_reads_root_values_from_the_movers_side():
-    """Resignation triggers on the mover's best root Q, after two plies."""
+    """Resignation triggers on the mover's best root Q, after two of its turns."""
     engine = _engine(resign_threshold=-0.90, resign_plies=2)
     game = _Game(allow_resign=True)
     game.root.expand(
@@ -253,14 +253,69 @@ def test_should_resign_reads_root_values_from_the_movers_side():
     game.root.Q = [-0.95, -0.97]      # every reply loses for the mover
     game.root.n_total = 8
 
-    assert engine._should_resign(game) is False   # one ply is not enough
-    assert engine._should_resign(game) is True    # two consecutive plies
+    assert engine._should_resign(game) is False   # one turn is not enough
+    assert engine._should_resign(game) is True    # two of White's own turns
     assert game.would_resign_side == chess.WHITE
 
     # A single good reply is enough to keep playing, and resets the streak.
     game.root.Q = [-0.95, 0.2]
     assert engine._should_resign(game) is False
-    assert game.resign_streak == 0
+    assert game.resign_streak[int(chess.WHITE)] == 0
+
+
+def test_the_resign_streak_survives_the_opponents_reply():
+    """Regression: consecutive plies alternate the side to move.
+
+    The streak used to be one counter shared by both sides. In a zero-sum game
+    the losing side's -0.95 is always followed by the winner's +0.95, so a
+    shared counter reset on every reply, could never exceed 1, and any
+    ``resign_plies`` above 1 was unsatisfiable -- resignation never fired at
+    all, at any threshold. It must survive the opponent's turn.
+    """
+    engine = _engine(resign_threshold=-0.90, resign_plies=2)
+    game = _Game(allow_resign=True)
+    game.root.expand(
+        [chess.Move.from_uci("e2e4"), chess.Move.from_uci("d2d4")],
+        [0, 1],
+        [0.5, 0.5],
+    )
+    game.root.N = [4, 4]
+    game.root.n_total = 8
+
+    # White to move, and lost: first of White's turns below the threshold.
+    game.root.Q = [-0.95, -0.97]
+    assert game.board.turn == chess.WHITE
+    assert engine._should_resign(game) is False
+
+    # Black replies. The same position is winning from Black's side, which is
+    # what used to clear the counter.
+    game.board.push(chess.Move.from_uci("e2e4"))
+    assert game.board.turn == chess.BLACK
+    game.root.Q = [0.95, 0.97]
+    assert engine._should_resign(game) is False
+    assert game.resign_streak[int(chess.WHITE)] == 1      # White's streak kept
+
+    # Back to White, still lost: the second of White's OWN turns fires it.
+    game.board.push(chess.Move.from_uci("e7e5"))
+    assert game.board.turn == chess.WHITE
+    game.root.Q = [-0.95, -0.97]
+    assert engine._should_resign(game) is True
+    assert game.would_resign_side == chess.WHITE
+
+
+def test_resignation_actually_fires_at_the_default_ply_count():
+    """End-to-end guard: the default resign_plies must be reachable.
+
+    Pinning this end to end, rather than only on _should_resign, is what would
+    have caught resignation being dead: the unit test above passed throughout,
+    because it called _should_resign twice without ever advancing the board.
+    """
+    engine = _engine(
+        games_in_flight=4, num_simulations=16, max_moves=200,
+        resign_threshold=1.0, resign_plies=2, resign_disable_fraction=0.0,
+    )
+    batch = engine.run(4)
+    assert batch.stats["resigned"] == 4, batch.stats
 
 
 def test_resign_disabled_game_is_played_out_but_still_measured():

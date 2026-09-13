@@ -143,7 +143,9 @@ class _Game:
         self.move_count = 0
         self.sims_left = 0
         self.allow_resign = allow_resign
-        self.resign_streak = 0
+        # Kept PER SIDE (indexed by chess.WHITE/BLACK as 1/0). See
+        # SelfPlayEngine._should_resign for why a single counter cannot work.
+        self.resign_streak = [0, 0]
         # Ply at which this game *would* have resigned, for games that are
         # played out anyway to measure the resign false-positive rate.
         self.would_resign_at: Optional[int] = None
@@ -252,7 +254,8 @@ class SelfPlayEngine:
         previous ply via subtree reuse count towards this total.
     resign_threshold:
         Resign once the mover's best root value stays at or below this for
-        ``resign_plies`` consecutive plies.  ``None`` disables resignation.
+        ``resign_plies`` consecutive turns OF THAT SIDE (not consecutive
+        plies, which alternate the mover).  ``None`` disables resignation.
     resign_disable_fraction:
         Fraction of games played to the end with resignation suppressed, used to
         measure how often resignation would have thrown away a non-loss.
@@ -532,16 +535,22 @@ class SelfPlayEngine:
                 seen = True
                 if root.Q[i] > best_q:
                     best_q = root.Q[i]
+        # The streak is per side. Consecutive plies alternate the mover, and in
+        # a zero-sum game the two sides' root values are opposite: the lost
+        # side's -0.95 is always followed by the winner's +0.95. One shared
+        # counter therefore resets every ply and can never exceed 1, which made
+        # any resign_plies above 1 unsatisfiable and resignation silently dead.
+        side = int(game.board.turn)
         if not seen:
-            game.resign_streak = 0
+            game.resign_streak[side] = 0
             return False
 
         if best_q <= self.resign_threshold:
-            game.resign_streak += 1
+            game.resign_streak[side] += 1
         else:
-            game.resign_streak = 0
+            game.resign_streak[side] = 0
 
-        if game.resign_streak < self.resign_plies:
+        if game.resign_streak[side] < self.resign_plies:
             return False
         if game.would_resign_at is None:
             game.would_resign_at = game.move_count

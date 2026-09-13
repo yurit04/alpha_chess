@@ -306,7 +306,7 @@ typedef struct {
     int sims_left;
     int move_count;
     int record_ply;      /* this ply gets a recorded training target */
-    int allow_resign, resign_streak, resigned;
+    int allow_resign, resign_streak[2], resigned;
     int would_resign_at, would_resign_side;
     int active;
 
@@ -576,7 +576,7 @@ static void new_game(Engine *e, Game *g)
     g->cur_rep = 0;
     g->root = arena_new_node(&g->arena);
     g->move_count = 0;
-    g->resign_streak = 0;
+    g->resign_streak[0] = g->resign_streak[1] = 0;
     g->resigned = 0;
     g->would_resign_at = -1;
     g->would_resign_side = -1;
@@ -779,12 +779,18 @@ static int should_resign(Engine *e, Game *g)
             seen = 1;
             if (a->cQ[base + i] > best_q) best_q = a->cQ[base + i];
         }
-    if (!seen) { g->resign_streak = 0; return 0; }
+    /* The streak is kept PER SIDE. Consecutive plies alternate the mover, and
+     * in a zero-sum game the two sides' root values are opposite: a lost side's
+     * -0.95 is always followed by the winner's +0.95. A single shared counter
+     * therefore resets every ply and can never exceed 1, which made any
+     * resign_plies above 1 unsatisfiable and resignation silently dead. */
+    const int side = (int)g->pos.side;
+    if (!seen) { g->resign_streak[side] = 0; return 0; }
 
-    if (best_q <= (float)e->resign_threshold) g->resign_streak++;
-    else g->resign_streak = 0;
+    if (best_q <= (float)e->resign_threshold) g->resign_streak[side]++;
+    else g->resign_streak[side] = 0;
 
-    if (g->resign_streak < e->resign_plies) return 0;
+    if (g->resign_streak[side] < e->resign_plies) return 0;
     if (g->would_resign_at < 0) {
         g->would_resign_at = g->move_count;
         g->would_resign_side = g->pos.side;
