@@ -608,6 +608,13 @@ falls back to **human vs human** with the agent and hints disabled.
 - **E** — enter the **board editor** (see below).
 - **ESC / Q** — quit.
 
+The side panel lists the pieces each side has **captured**, with the material
+balance (`+3`) beside whoever is ahead. Captures are derived by replaying the
+game's moves rather than by diffing against a full starting complement, so a
+promotion is not reported as a captured pawn and a game begun from a FEN simply
+shows nothing taken --- while the balance, counted from the pieces on the board,
+stays correct either way and values a promoted queen at nine.
+
 The piece that moved last is **boxed in green** on the square it now occupies
 — so whenever it is your turn, the box is around your opponent's piece. It is
 a hard-edged border rather than a tint, which stays legible on light and dark
@@ -657,9 +664,10 @@ works for making moves; asking for a suggestion just shows
 - **M** — mute / unmute the move sounds.
 - **Q / ESC** — quit.
 
-The piece that moved last is boxed in green, and every move plays a short
-click — useful here for confirming that a move you mirrored from the other
-application actually registered.
+The piece that moved last is boxed in green, the panel lists captured pieces
+and the material balance, and every move plays a short click — useful here for
+confirming that a move you mirrored from the other application actually
+registered.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -1110,7 +1118,7 @@ tests/
   test_mcts.py         interactive search: terminal handling, mate-in-one, caching
   test_native.py       perft + native-vs-Python parity for movegen, indices and planes
   test_evaluate.py     Elo estimation and UCI strength limiting (clamping, skill level)
-  test_gui.py          GUI undo/redo, last-move box, move sounds (headless)
+  test_gui.py          GUI undo/redo, last-move box, captures, sounds (headless)
 requirements.txt
 README.md
 ```
@@ -1179,6 +1187,14 @@ history is discarded whenever the game moves onto a different line: a
 different move played by hand, a new game, or a position adopted from the
 editor. It also checks `R` is redo in play mode while still resetting the
 editor in setup mode.
+
+It also covers the captured-piece panel: that en passant counts the pawn it
+actually takes (the victim is not on the destination square), that a promotion
+is not mistaken for a capture and is valued at nine, that captures are credited
+to the right side and listed most valuable first, that a game begun from a FEN
+reports nothing taken but still scores the balance correctly, that the display
+follows undo/redo and resets on a new game, and that a heavily-captured row
+compresses instead of overflowing the panel.
 
 It also covers the last-move box and the move sounds: that the destination
 square is boxed and the origin and untouched squares are not, that it is a

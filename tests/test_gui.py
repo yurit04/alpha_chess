@@ -23,8 +23,11 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 pygame = pytest.importorskip("pygame")
 
 from alpha_chess.gui import (  # noqa: E402
+    BOARD_PX,
     LASTMOVE_COLOR,
     MARGIN,
+    PANEL_BG,
+    PANEL_PX,
     SQUARE,
     _AUDIO_HZ,
     _GuiApp,
@@ -393,3 +396,120 @@ def test_muted_bank_plays_nothing(surface):
     bank.play("move")            # must be a silent no-op, not an error
     bank.enabled = False
     bank.play("capture")
+
+
+# --------------------------------------------------------------------------- #
+# Captured pieces and material balance
+# --------------------------------------------------------------------------- #
+def _letters(piece_types):
+    sym = {chess.PAWN: "P", chess.KNIGHT: "N", chess.BISHOP: "B",
+           chess.ROOK: "R", chess.QUEEN: "Q"}
+    return "".join(sym[p] for p in piece_types)
+
+
+def test_fresh_board_has_nothing_captured(surface):
+    app = _app(surface, advisor=True)
+    by_white, by_black, balance = app.material()
+    assert by_white == [] and by_black == []
+    assert balance == 0
+
+
+def test_a_capture_is_credited_to_the_side_that_made_it(surface):
+    app = _app(surface, advisor=True)
+    _play(app, ["e4", "d5", "exd5"])          # White takes a pawn
+    by_white, by_black, balance = app.material()
+    assert _letters(by_white) == "P"
+    assert by_black == []
+    assert balance == 1
+
+
+def test_en_passant_counts_the_pawn_it_actually_takes(surface):
+    """The victim is not on the destination square, so a naive read misses it."""
+    app = _app(surface, advisor=True)
+    _play(app, ["e4", "a6", "e5", "d5", "exd6"])
+    assert app.board.move_stack[-1].to_square == chess.D6
+    by_white, by_black, balance = app.material()
+    assert _letters(by_white) == "P"
+    assert balance == 1
+
+
+def test_promotion_is_not_mistaken_for_a_capture(surface):
+    """A pawn leaves the board with nobody taking it."""
+    app = _app(surface, advisor=True)
+    app.board = chess.Board("8/P6k/8/8/8/8/7K/8 w - - 0 1")
+    _play(app, ["a8=Q"])
+    by_white, by_black, balance = app.material()
+    assert by_white == [] and by_black == []
+    assert balance == 9                        # the new queen, not a pawn
+
+
+def test_balance_counts_promoted_pieces_at_their_new_value(surface):
+    app = _app(surface, advisor=True)
+    app.board = chess.Board("8/P6k/8/8/8/8/7K/8 w - - 0 1")
+    assert app.material()[2] == 1              # still a pawn
+    _play(app, ["a8=Q"])
+    assert app.material()[2] == 9              # now a queen
+
+
+def test_captures_are_listed_most_valuable_first(surface):
+    app = _app(surface, advisor=True)
+    _play(app, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Nf6", "Ng5", "d5",
+                "exd5", "Nxd5", "Nxf7", "Kxf7", "Qf3+", "Ke6", "Nc3",
+                "Ncb4", "a3", "Nxc2+", "Kd1", "Nxa1"])
+    by_white, by_black, balance = app.material()
+    assert _letters(by_white) == "PP"
+    assert _letters(by_black) == "RNPP"        # rook, knight, then pawns
+    assert balance == -8
+
+
+def test_a_game_begun_from_a_fen_reports_no_captures(surface):
+    """Nothing was seen taken, but the balance is still right."""
+    app = _app(surface, advisor=True)
+    app.board = chess.Board("4k3/8/8/8/8/8/8/R3K3 w Q - 0 1")
+    by_white, by_black, balance = app.material()
+    assert by_white == [] and by_black == []
+    assert balance == 5
+
+
+def test_material_follows_undo_and_redo(surface):
+    app = _app(surface, advisor=True)
+    _play(app, ["e4", "d5", "exd5"])
+    assert app.material()[2] == 1
+    app._undo()
+    assert app.material() == ([], [], 0)
+    app._redo()
+    assert _letters(app.material()[0]) == "P"
+    assert app.material()[2] == 1
+
+
+def test_material_resets_with_a_new_game(surface):
+    app = _app(surface, advisor=True)
+    _play(app, ["e4", "d5", "exd5"])
+    app._new_game()
+    assert app.material() == ([], [], 0)
+
+
+def test_the_panel_shows_the_capture_rows(surface):
+    """Something must actually be drawn, not just computed."""
+    app = _app(surface, advisor=True)
+    app.draw()
+    panel = pygame.Rect(BOARD_PX, 130, PANEL_PX, 60)
+    before = app.surface.subsurface(panel).copy()
+
+    _play(app, ["e4", "d5", "exd5"])
+    app.draw()
+    after = app.surface.subsurface(panel).copy()
+    assert pygame.image.tostring(before, "RGB") != pygame.image.tostring(after, "RGB")
+
+
+def test_many_captures_stay_inside_the_panel(surface):
+    """The glyph run compresses rather than running off the edge."""
+    app = _app(surface, advisor=True)
+    heavy = ([chess.QUEEN, chess.ROOK, chess.ROOK, chess.BISHOP, chess.BISHOP,
+              chess.KNIGHT, chess.KNIGHT] + [chess.PAWN] * 8)
+    app.material = lambda: (heavy, heavy, 0)
+    app.draw()                                  # must not raise or overflow
+    # The rightmost panel column stays panel-coloured: nothing drew past it.
+    edge = BOARD_PX + PANEL_PX - 2
+    for yy in range(130, 190):
+        assert app.surface.get_at((edge, yy))[:3] == PANEL_BG

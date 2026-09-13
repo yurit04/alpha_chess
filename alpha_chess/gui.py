@@ -52,6 +52,18 @@ DEST_COLOR = (90, 150, 70)         # legal-destination marker
 HINT_COLOR = (74, 144, 226)        # hint / analysis from-to highlight
 LASTMOVE_COLOR = (54, 211, 92)     # border around the piece that just moved
 LASTMOVE_WIDTH = 5                 # thickness of that border, in pixels
+CAPTURED_LABEL = (150, 150, 158)   # "White"/"Black" labels on the capture rows
+CAPTURED_CHIP = (74, 74, 82)       # strip behind them, so black pieces are visible
+LEAD_COLOR = (250, 220, 120)       # the +N material advantage
+
+# Conventional point values, used only for the displayed material balance.
+# The king is absent: it is never captured, so it never enters the sum.
+PIECE_VALUES = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9,
+}
+# Captured pieces are listed most valuable first.
+_CAPTURE_ORDER = (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN)
 PANEL_BG = (40, 40, 45)
 PANEL_FG = (230, 230, 230)
 PANEL_DIM = (170, 170, 175)
@@ -213,6 +225,55 @@ def _screen_to_square(pos: Tuple[int, int], flipped: bool) -> Optional[int]:
         file = col
         rank = 7 - row
     return chess.square(int(file), int(rank))
+
+
+def _material_balance(board: chess.Board) -> int:
+    """Material score from White's point of view, in pawns.
+
+    Counted from the pieces actually on the board rather than by summing the
+    captures, so promotions are reflected: a promoted queen is worth nine here
+    whatever the pawn that became it was worth.
+    """
+    score = 0
+    for piece_type, value in PIECE_VALUES.items():
+        score += value * len(board.pieces(piece_type, chess.WHITE))
+        score -= value * len(board.pieces(piece_type, chess.BLACK))
+    return score
+
+
+def _captured_pieces(board: chess.Board):
+    """Return ``(taken_by_white, taken_by_black)`` as piece-type lists.
+
+    Derived by replaying the move stack rather than by diffing against a full
+    starting complement, because the two disagree exactly where it matters: a
+    promotion removes a pawn without anyone capturing it, and a game begun from
+    a FEN never had the missing pieces in the first place. Replaying reports
+    only captures actually seen, so a position adopted from the editor starts
+    with empty lists and a material balance that is still correct.
+
+    Each list is ordered most valuable first.
+    """
+    replay = board.copy()
+    moves = list(replay.move_stack)
+    for _ in moves:
+        replay.pop()
+
+    by_white: List[int] = []
+    by_black: List[int] = []
+    for move in moves:
+        if replay.is_capture(move):
+            # En passant takes a pawn that is not on the destination square.
+            victim = (chess.PAWN if replay.is_en_passant(move)
+                      else replay.piece_type_at(move.to_square))
+            if victim is not None:
+                if replay.turn == chess.WHITE:
+                    by_white.append(victim)
+                else:
+                    by_black.append(victim)
+        replay.push(move)
+
+    key = _CAPTURE_ORDER.index
+    return sorted(by_white, key=key), sorted(by_black, key=key)
 
 
 def _draw_board_backdrop(pygame, screen, flipped: bool) -> None:
@@ -469,6 +530,10 @@ class _GuiApp:
         # Move sounds. Skipped entirely without a display, so headless
         # rendering and tests never touch an audio device.
         self.sounds = _SoundBank(pygame) if has_display else None
+        # Cached (key, captures, balance); recomputed only when the position
+        # changes, since replaying the move stack is O(plies) and draw() runs
+        # every frame.
+        self._material_cache = None
 
         # ----- setup-mode state -----
         self.mode = "play"
@@ -945,6 +1010,20 @@ class _GuiApp:
             self._setup_click(pos, button)
 
     # ------------------------------------------------------------------ draw
+    def material(self):
+        """``(taken_by_white, taken_by_black, balance)`` for the current board.
+
+        Cached on the board's placement and ply count: together those fix the
+        captures (two routes to the same placement at the same ply took the
+        same pieces), so the cache cannot serve a stale answer across undo,
+        redo, a new game or a position adopted from the editor.
+        """
+        key = (self.board.board_fen(), len(self.board.move_stack))
+        if self._material_cache is None or self._material_cache[0] != key:
+            taken = _captured_pieces(self.board)
+            self._material_cache = (key, taken, _material_balance(self.board))
+        return self._material_cache[1] + (self._material_cache[2],)
+
     def draw(self) -> None:
         if self.mode == "play":
             _draw(
@@ -953,7 +1032,7 @@ class _GuiApp:
                 self.hint_squares, self.panel_font, self.panel_small,
                 self.panel_bold, self.status_msg, self.eval_msg,
                 self.hint_info, self.agent, self.agent_error, self.thinking,
-                self.coord_font, self.advisor,
+                self.coord_font, self.advisor, self.material(),
             )
         else:
             self._draw_setup()
@@ -1214,7 +1293,7 @@ def _draw(
     pygame, screen, renderer, board, flipped, selected, legal_dests,
     hint_squares, panel_font, panel_small, panel_bold, status_msg,
     eval_msg, hint_info, agent, agent_error, thinking, coord_font=None,
-    advisor=False,
+    advisor=False, material=None,
 ) -> None:
     """Render the board, highlights, pieces and side panel (PLAY mode).
 
@@ -1310,6 +1389,44 @@ def _draw(
                 line(agent_error, panel_small, (240, 160, 160), dy=22)
             line("Human vs Human", panel_small, PANEL_DIM, dy=22)
             line("(agent / hints disabled)", panel_small, PANEL_DIM, dy=26)
+
+    # --- captured pieces + material balance ---
+    def capture_row(label: str, taken, colour: bool, lead: int) -> None:
+        """One side's haul: its label, the pieces it took, its lead if any."""
+        nonlocal y
+        screen.blit(panel_small.render(label, True, CAPTURED_LABEL), (px, y))
+
+        lead_text = "+%d" % lead if lead > 0 else ""
+        lead_w = panel_small.size(lead_text)[0] + 8 if lead_text else 0
+        gx = px + 44
+        # Room for the glyphs is whatever the label and the lead leave over;
+        # they overlap rather than wrap when a side has taken a lot.
+        room = (BOARD_PX + PANEL_PX - 14) - gx - lead_w
+        step = min(13, room // len(taken)) if taken else 0
+        if taken:
+            # Black pieces are drawn black-on-dark and all but disappear
+            # against the panel, so the run sits on a lighter strip.
+            run_w = step * (len(taken) - 1) + 17
+            pygame.draw.rect(screen, CAPTURED_CHIP,
+                             (gx, y - 1, run_w, 20), border_radius=4)
+        for piece_type in taken:
+            renderer.draw_piece_at(
+                screen, chess.Piece(piece_type, colour), gx + 8, y + 8, 18)
+            gx += step
+        if lead_text:
+            surf = panel_small.render(lead_text, True, LEAD_COLOR)
+            screen.blit(surf,
+                        (BOARD_PX + PANEL_PX - 14 - surf.get_width(), y))
+        y += 24
+
+    if material is not None:
+        by_white, by_black, balance = material
+        if by_white or by_black or balance:
+            y += 8
+            # A side's row shows the pieces IT captured, so the glyphs are the
+            # opponent's colour.
+            capture_row("White", by_white, chess.BLACK, balance)
+            capture_row("Black", by_black, chess.WHITE, -balance)
 
     # --- hint info block (best-move suggestion) ---
     if hint_info:
